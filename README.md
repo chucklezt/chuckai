@@ -31,8 +31,8 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 │ llama-server│  │    SearXNG      │  │  Pipelines     │
 │  port 8080  │  │   port 8081     │  │  port 9099     │
 │             │  │                 │  │  (Phase 3)     │
-│ Qwen 3.5 9B │  │ Web-augmented   │  │                │
-│ or 27B      │  │ search          │  │                │
+│ qwen-active │  │ Web-augmented   │  │                │
+│ (symlink)   │  │ search          │  │                │
 │ AMD RX 6800 │  │                 │  │                │
 │ XT (ROCm)   │  │                 │  │                │
 └─────────────┘  └─────────────────┘  └────────────────┘
@@ -79,22 +79,50 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 
 ## Models
 
-| Model | Quantization | VRAM | Speed | Context |
-|---|---|---|---|---|
-| Qwen3.5 9B (primary) | Q4_K_M | ~7 GB | 40–60 t/s | 131K configured |
-| Qwen3.5 27B (custom) | Q3_K_M | ~13 GB | 15–20 t/s | 32K configured |
+### Model Files
 
-The 27B model was custom-quantized using llama.cpp's quantize tool — the standard Q4_K_M release is 17GB and spills beyond the 16GB VRAM ceiling. The Q3_K_M variant fits at 13GB with 3GB headroom.
+| File | Quantization | Size | Notes |
+|---|---|---|---|
+| `Qwen3.5-9B-Q6_K.gguf` | Q6_K | 7.0 GB | Primary — high quality, fully on GPU |
+| `Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Q4_K_M | 5.5 GB | Fallback — lower VRAM, faster load |
+| `qwen3.5-27b-q3_K_M.gguf` | Q3_K_M | 13.4 GB | Custom quantized — capable, still on GPU |
 
-### VRAM configurations
+> **Note:** `qwen3.5-27b-f16.gguf` (54GB) is the intermediate conversion artifact used to produce the Q3_K_M. It can be safely deleted once the Q3_K_M is confirmed working — `rm ~/models/qwen3.5-27b-f16.gguf` recovers 54GB.
 
-| Config | Model | KV Cache | Context | Total VRAM | Headroom |
-|---|---|---|---|---|---|
-| A — Current | Q4_K_M | q4_0 | 128K | 10.65 GB | 5.35 GB |
-| B — Will spill | Q6_K | q8_0 | 128K | 15.95 GB | ~0 GB |
-| C — Recommended | Q6_K | q8_0 | 32K | 8.70 GB | 7.30 GB |
+### Active Model Symlink
 
-Config C delivers a better model (Q6_K vs Q4_K_M) at higher KV cache precision (q8_0 vs q4_0) using *less* VRAM than the current setup — the single tradeoff is reducing context from 128K to 32K tokens.
+llama-server loads `~/models/qwen-active.gguf` — a symlink that points to whichever model is currently active. Switching models requires only repointing the symlink and restarting llama-server. Open WebUI configuration never needs to change.
+
+```bash
+# Current state
+ls -la ~/models/qwen-active.gguf
+# qwen-active.gguf -> /home/chuck/models/Qwen3.5-9B-Q6_K.gguf
+
+# Switch to 27B Q3_K_M
+ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
+
+# Switch to 9B Q4_K_M (lower VRAM)
+ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf
+
+# Switch back to 9B Q6_K (primary)
+ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+```
+
+### VRAM Configurations
+
+| Config | Model | KV Cache | Context | Total VRAM | Headroom | Status |
+|---|---|---|---|---|---|---|
+| A — Fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | ~5.3 GB | Available |
+| B — Will spill | Q6_K 9B | q8_0 | 131K | ~16.0 GB | ~0 GB | Avoid |
+| C — Primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | ~1.5 GB | Active |
+| D — Comfortable | Q6_K 9B | q4_0 | 32K | ~8.7 GB | ~7.3 GB | Use for non-coding |
+| E — Large model | Q3_K_M 27B | q4_0 | 32K | ~14.0 GB | ~2.0 GB | Use for complex tasks |
+
+**Config C (Active):** Q6_K at 131K context with q4_0 KV cache sits at ~14.5GB (84% VRAM). Confirmed fully on GPU — `load_tensors: offloaded 33/33 layers to GPU`. The 1.5GB headroom is tight but sufficient for coding sessions up to ~75K tokens. Monitor with `watch -n 2 "rocm-smi --showmeminfo vram | grep Used"` during long sessions.
+
+> **Why Q6_K over Q4_K_M?** Q6_K delivers meaningfully better output quality — sharper reasoning, more accurate code, better instruction following — at only 1.5GB additional VRAM over Q4_K_M. The quality improvement is particularly noticeable in coding and multi-step reasoning tasks. The tradeoff is reduced VRAM headroom at 131K context.
+
+> **Why not q8_0 KV cache?** At 131K context, q8_0 KV cache consumes an additional ~3GB versus q4_0, pushing total VRAM to the ceiling (~16GB) with effectively zero headroom. q4_0 KV cache at this context size is the correct choice. If context is reduced to 32K, q8_0 becomes viable and improves attention fidelity in long multi-turn sessions.
 
 ---
 
@@ -106,7 +134,7 @@ Config C delivers a better model (Q6_K vs Q4_K_M) at higher KV cache precision (
 - OpenAI-compatible API at `http://192.168.1.59:8080/v1`
 - Full chat UI with conversation history, system prompts, and model switching
 - Live web search augmentation via self-hosted SearXNG
-- Dual-model setup — switch between 9B (fast) and 27B (capable) with a single command
+- Dual-model setup — switch between 9B (fast) and 27B (capable) via symlink
 - Accessible from any device on the local network
 
 ### Phase 2 — In Development
@@ -146,37 +174,44 @@ cd chuckai
 
 ```bash
 cp configs/docker-compose.yml ~/docker-compose.yml
-cp configs/start-llama-qwe359.sh ~/start-llama-qwe359.sh
-cp configs/start-llama-27b.sh ~/start-llama-27b.sh
+cp configs/start-llama-qwen.sh ~/start-llama-qwen.sh
 mkdir -p ~/searxng
 cp configs/searxng-settings.yml ~/searxng/settings.yml
-chmod +x ~/start-llama-*.sh
+chmod +x ~/start-llama-qwen.sh
 ```
 
-### 3. Download a model
+### 3. Download models
 
 ```bash
 mkdir -p ~/models
 pip3 install huggingface_hub
-python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-  repo_id='bartowski/Qwen_Qwen3.5-9B-Instruct-GGUF',
-  local_dir='/home/$USER/models/qwen3.5-9b',
-  allow_patterns=['*Q4_K_M*']
-)
-"
+
+# Primary model — Q6_K (recommended)
+huggingface-cli download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q6_K.gguf \
+  --local-dir /home/$USER/models/
+
+# Fallback model — Q4_K_M (lower VRAM)
+huggingface-cli download bartowski/Qwen_Qwen3.5-9B-Instruct-GGUF \
+  Qwen_Qwen3.5-9B-Instruct-Q4_K_M.gguf \
+  --local-dir /home/$USER/models/
 ```
 
-### 4. Start llama-server
+### 4. Create the active model symlink
 
 ```bash
-bash ~/start-llama-qwe359.sh &
+# Point to Q6_K as primary
+ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+```
+
+### 5. Start llama-server
+
+```bash
+bash ~/start-llama-qwen.sh &
 sleep 15 && curl -s http://localhost:8080/health
 # Expected: {"status":"ok"}
 ```
 
-### 5. Start Docker services
+### 6. Start Docker services
 
 ```bash
 cd ~ && docker compose up -d
@@ -184,7 +219,7 @@ sleep 10 && curl -s http://localhost:3000/api/version
 # Expected: {"version":"0.5.20"}
 ```
 
-### 6. Configure web search
+### 7. Configure web search
 
 Open `http://192.168.1.59:3000` → Admin Panel → Settings → Web Search:
 - Enable Web Search: **ON**
@@ -198,16 +233,42 @@ The globe icon will appear in the chat input bar. Click it to enable web-augment
 
 ## Service Management
 
-### Model switching
+### Start and stop llama-server
 
 ```bash
-# Switch to 27B model
-pkill -9 llama-server && sleep 3 && bash ~/start-llama-27b.sh &
+# Start
+bash ~/start-llama-qwen.sh &
 
-# Switch back to 9B
-pkill -9 llama-server && sleep 3 && bash ~/start-llama-qwe359.sh &
+# Stop
+pkill -9 llama-server
 
-# Check which model is loaded
+# Check status
+curl -s http://localhost:8080/health
+pgrep -fa llama-server
+```
+
+### Switching models via symlink
+
+```bash
+# Switch to 27B — complex reasoning tasks
+pkill -9 llama-server
+ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
+sleep 3 && bash ~/start-llama-qwen.sh &
+
+# Switch to 9B Q6_K — primary (coding, chat, RAG)
+pkill -9 llama-server
+ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+sleep 3 && bash ~/start-llama-qwen.sh &
+
+# Switch to 9B Q4_K_M — lowest VRAM, fastest load
+pkill -9 llama-server
+ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf
+sleep 3 && bash ~/start-llama-qwen.sh &
+
+# Check which model is currently active
+ls -la ~/models/qwen-active.gguf
+
+# Confirm what llama-server loaded
 curl -s http://localhost:8080/v1/models | python3 -c \
   "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])"
 ```
@@ -217,27 +278,58 @@ curl -s http://localhost:8080/v1/models | python3 -c \
 Add to `~/.bashrc`:
 
 ```bash
-alias model-9b='pkill -9 llama-server; sleep 3; bash ~/start-llama-qwe359.sh & echo "Starting 9B..."'
-alias model-27b='pkill -9 llama-server; sleep 3; bash ~/start-llama-27b.sh & echo "Starting 27B..."'
-alias model-status='curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])"'
+alias model-9b-q6='pkill -9 llama-server; sleep 3; \
+  ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf; \
+  bash ~/start-llama-qwen.sh & echo "Starting 9B Q6_K..."'
+
+alias model-9b-q4='pkill -9 llama-server; sleep 3; \
+  ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf; \
+  bash ~/start-llama-qwen.sh & echo "Starting 9B Q4_K_M..."'
+
+alias model-27b='pkill -9 llama-server; sleep 3; \
+  ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf; \
+  bash ~/start-llama-qwen.sh & echo "Starting 27B Q3_K_M..."'
+
+alias model-status='ls -la ~/models/qwen-active.gguf && \
+  curl -s http://localhost:8080/v1/models | python3 -c \
+  "import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])"'
+```
+
+Apply changes:
+
+```bash
+source ~/.bashrc
+```
+
+### Docker services
+
+```bash
+docker compose up -d        # start all services
+docker compose down         # stop all services
+docker compose restart      # restart all services
+docker compose ps           # check status
+docker compose logs -f      # watch logs
 ```
 
 ### Full stack health check
 
 ```bash
 echo "=== llama.cpp ===" && curl -s http://localhost:8080/health
+echo "=== Active model ===" && ls -la ~/models/qwen-active.gguf
 echo "=== Open WebUI ===" && curl -s http://localhost:3000/api/version
 echo "=== SearXNG ===" && curl -s "http://localhost:8081/search?q=test&format=json" \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'OK - {len(d[\"results\"])} results')"
 echo "=== Docker ===" && docker compose ps
-echo "=== GPU ===" && rocm-smi --showtemp 2>/dev/null | grep -E "GPU|Temp"
+echo "=== GPU ===" && rocm-smi --showmeminfo vram | grep -E "Used|Total"
 ```
 
 ### GPU monitoring
 
 ```bash
-rocm-smi               # current state
-watch -n 1 rocm-smi    # live refresh
+rocm-smi                                              # current state
+watch -n 1 rocm-smi                                   # live refresh
+watch -n 2 "rocm-smi --showmeminfo vram | grep Used"  # VRAM only
+grep "offload" ~/llama.log | head -5                  # confirm GPU layers at startup
 ```
 
 ---
