@@ -1,0 +1,26 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.5.20
+    container_name: open-webui
+    network_mode: host
+    environment:
+      - OPENAI_API_BASE_URL=http://localhost:8080/v1
+      - OPENAI_API_KEY=dummy
+      - PORT=3000
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - BASE_URL=http://localhost:8081/
+      - INSTANCE_NAME=chuckai-search
+
+volumes:
+  chuck_open-webui:
+    external: true

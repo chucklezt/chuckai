@@ -1,0 +1,30 @@
+# Model files — too large for git
+*.gguf
+
+# Log files
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environment secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Vector DB data
+qdrant_storage/
+
+# Mounted drives
+/mnt/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store
+
+# Live SearXNG config (contains real secret_key — stays on server only)
+searxng/settings.yml

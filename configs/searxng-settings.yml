@@ -1,0 +1,12 @@
+use_default_settings: true
+
+server:
+  base_url: http://localhost:8081/
+  port: 8081
+  bind_address: "0.0.0.0"
+  secret_key: "CHANGE_THIS_TO_A_LONG_RANDOM_STRING"
+
+search:
+  formats:
+    - html
+    - json
