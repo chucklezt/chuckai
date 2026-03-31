@@ -162,6 +162,8 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - AMD ROCm 6.3 installed
 - Docker CE and Docker Compose v2
 - llama.cpp built from source with HIP backend
+- [The blog post](https://chucktsocanos.com/#blog/building-private-ai-server-part1)
+- [The build document](https://chucktsocanos.com/downloads/ubuntu-ai-setup-procedure.docx)
 
 ### 1. Clone this repository
 
