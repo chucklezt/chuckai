@@ -1,8 +1,10 @@
 services:
   open-webui:
-    image: ghcr.io/open-webui/open-webui:v0.5.20
+    image: ghcr.io/open-webui/open-webui:latest
     container_name: open-webui
     network_mode: host
+    volumes:
+      - chuck_open-webui:/app/backend/data
     environment:
       - OPENAI_API_BASE_URL=http://localhost:8080/v1
       - OPENAI_API_KEY=dummy

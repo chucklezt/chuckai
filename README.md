@@ -22,7 +22,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 └─────────────────────────┬───────────────────────────────┘
                           │ http://192.168.1.59:3000
 ┌─────────────────────────▼───────────────────────────────┐
-│              Open WebUI v0.5.20  (port 3000)             │
+│              Open WebUI v0.8.12  (port 3000)             │
 │         Chat UI · Web Search · Model Switching           │
 └──────┬──────────────────┬──────────────────┬────────────┘
        │                  │                  │
@@ -68,7 +68,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 | Component | Software | Version | Purpose |
 |---|---|---|---|
 | Inference | llama.cpp | build 8454 | GPU-accelerated LLM serving via ROCm |
-| Chat UI | Open WebUI | v0.5.20 | Full-featured chat interface |
+| Chat UI | Open WebUI | v0.8.12 | Full-featured chat interface |
 | Web Search | SearXNG | 2026.3.18 | Self-hosted web search augmentation |
 | Containers | Docker CE | 29.3.0 | Hosts WebUI and SearXNG |
 | Embeddings | Ollama + nomic-embed-text | 0.18.2 | RAG embeddings on CPU (Phase 2) |
@@ -218,7 +218,7 @@ sleep 15 && curl -s http://localhost:8080/health
 ```bash
 cd ~ && docker compose up -d
 sleep 10 && curl -s http://localhost:3000/api/version
-# Expected: {"version":"0.5.20"}
+# Expected: {"version":"0.8.12"}
 ```
 
 ### 7. Configure web search
@@ -311,6 +311,50 @@ docker compose down         # stop all services
 docker compose restart      # restart all services
 docker compose ps           # check status
 docker compose logs -f      # watch logs
+```
+
+### Open WebUI backup and rollback
+
+Open WebUI was upgraded from v0.5.20 to v0.8.12 on 2026-04-01. Local backups were created before the upgrade:
+
+| Backup | Location | Contents |
+|---|---|---|
+| v0.5.20 container image | `open-webui-backup:v0.5.20` | Full container snapshot via `docker commit` |
+| v0.5.20 data | `~/open-webui-backup-v0.5.20/data/` | webui.db, cache, uploads, vector_db |
+| v0.8.12 container image | `open-webui-backup:v0.8.12` | Post-upgrade container snapshot |
+| Persistent data volume | `chuck_open-webui` | Named Docker volume, survives container recreation |
+
+**Roll back to v0.5.20:**
+
+```bash
+# 1. Stop current container
+cd ~ && docker compose down
+
+# 2. Edit ~/docker-compose.yml — change the image line:
+#    image: ghcr.io/open-webui/open-webui:latest
+#    to:
+#    image: open-webui-backup:v0.5.20
+
+# 3. Restore the v0.5.20 data backup into the named volume
+docker run --rm \
+  -v chuck_open-webui:/data \
+  -v ~/open-webui-backup-v0.5.20/data:/backup \
+  alpine sh -c "rm -rf /data/* && cp -a /backup/. /data/"
+
+# 4. Start with the old version
+docker compose up -d
+
+# 5. Verify
+curl -s http://localhost:3000/api/version
+# Expected: {"version":"0.5.20"}
+```
+
+**Roll back to v0.8.12 (if a future `:latest` breaks):**
+
+```bash
+cd ~ && docker compose down
+# Edit ~/docker-compose.yml — change image to: open-webui-backup:v0.8.12
+docker compose up -d
 ```
 
 ### Full stack health check

@@ -32,7 +32,7 @@ The stack is intentionally positioned as the on-premises counterpart to the GCP-
 | Component | Version |
 |---|---|
 | llama.cpp | build 8454 (fb78ad29b) |
-| Open WebUI | v0.5.20 (pinned — see rules below) |
+| Open WebUI | v0.8.12 (via :latest tag — see backup/rollback section) |
 | SearXNG | 2026.3.18-3810dc9d1 |
 | Docker CE | 29.3.0 |
 | Docker Compose | v5.1.0 |
@@ -51,7 +51,7 @@ chuckai/
 ├── README.md                   # Public-facing project documentation
 ├── .gitignore                  # Excludes models, logs, vector DB data
 ├── configs/                    # All service configuration files
-│   ├── docker-compose.yml      # Open WebUI + SearXNG — the working compose file
+│   ├── docker-compose.yml      # Open WebUI (latest/v0.8.12) + SearXNG — the working compose file
 │   ├── start-llama-qwe359.sh   # llama-server startup — Qwen 3.5 9B Q4
 │   ├── start-llama-27b.sh      # llama-server startup — Qwen 3.5 27B Q3 (custom quant)
 │   └── searxng-settings.yml    # SearXNG configuration
@@ -79,7 +79,7 @@ chuckai/
 The following is fully working and validated:
 
 - **llama.cpp** serving Qwen 3.5 9B Q4_K_M on port 8080 via RX 6800 XT (ROCm)
-- **Open WebUI** v0.5.20 on port 3000 — chat, conversation history, model switching
+- **Open WebUI** v0.8.12 on port 3000 — chat, conversation history, model switching
 - **SearXNG** on port 8081 — web-augmented responses via globe icon in chat
 - **Web search** configured via Admin Panel UI (not env vars)
 - **Model switching** between 9B and 27B via separate startup scripts
@@ -120,8 +120,33 @@ The following is fully working and validated:
 
 These rules exist because we learned them the hard way. Breaking them will cost hours of debugging.
 
-### 1. Never upgrade Open WebUI without explicit instruction
-Open WebUI is pinned to `v0.5.20`. Versions 0.6.x and 0.8.x have streaming compatibility bugs with llama.cpp OpenAI endpoints that cause "Expecting value: line 1 column 1 (char 0)" errors in the browser. The `main` tag auto-updates on every container restart — always use the explicit version tag.
+### 1. Open WebUI upgrade/rollback procedure
+Open WebUI was upgraded from v0.5.20 to v0.8.12 on 2026-04-01. The `:latest` tag is now used in docker-compose. Before upgrading, backups were created:
+
+**Backups available:**
+- **v0.5.20 container image:** `open-webui-backup:v0.5.20` (local Docker image)
+- **v0.5.20 data:** `~/open-webui-backup-v0.5.20/data/` (contains webui.db, cache, uploads, vector_db)
+- **v0.8.12 container image:** `open-webui-backup:v0.8.12` (local Docker image)
+- **Persistent data volume:** `chuck_open-webui` (named Docker volume, survives container recreation)
+
+**To roll back to v0.5.20:**
+```bash
+# 1. Stop current container
+cd ~ && docker compose down
+
+# 2. Update docker-compose.yml to use the backup image
+#    Change: image: ghcr.io/open-webui/open-webui:latest
+#    To:     image: open-webui-backup:v0.5.20
+
+# 3. Restore the v0.5.20 data backup
+docker run --rm -v chuck_open-webui:/data -v ~/open-webui-backup-v0.5.20/data:/backup alpine \
+  sh -c "rm -rf /data/* && cp -a /backup/. /data/"
+
+# 4. Start with old version
+docker compose up -d
+```
+
+**Note:** The earlier v0.5.20 pinning was due to streaming bugs in 0.6.x with llama.cpp. v0.8.12 resolved these issues. If a future `:latest` pull introduces regressions, pin to `v0.8.12` using the backup image or the registry tag.
 
 ### 2. Always use OPENAI_API_BASE_URL, never OLLAMA_BASE_URL
 Open WebUI connects to llama.cpp via the OpenAI-compatible `/v1` endpoint. Using `OLLAMA_BASE_URL` causes Open WebUI to operate in Ollama mode which appends `:latest` to every model name, causing "model not found" errors.
@@ -133,7 +158,7 @@ Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break O
 SearXNG always binds internally to port 8080 regardless of settings.yml. Use `ports: "8081:8080"` in docker-compose. Do not use `network_mode: host` for SearXNG — it will collide with llama-server on 8080.
 
 ### 5. Web search must be configured via Admin Panel UI
-Do NOT add `ENABLE_RAG_WEB_SEARCH`, `SEARXNG_QUERY_URL`, or related env vars to docker-compose for Open WebUI v0.5.20. These cause the model to hang and never respond. Configure web search exclusively through Admin Panel → Settings → Web Search.
+Do NOT add `ENABLE_RAG_WEB_SEARCH`, `SEARXNG_QUERY_URL`, or related env vars to docker-compose. These caused the model to hang in v0.5.20 and should still be configured through Admin Panel → Settings → Web Search to avoid regressions.
 
 ### 6. SearXNG settings.yml requires a secret_key
 SearXNG crashes on startup without `secret_key` set in settings.yml. The `json` format must also be in the formats list or Open WebUI cannot parse search results.
