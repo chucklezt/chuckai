@@ -22,7 +22,7 @@ class Pipeline:
         embed_model: str = Field(default="nomic-embed-text")
         collection_hot: str = Field(default="docs_hot")
         collection_cold: str = Field(default="docs_cold")
-        top_k: int = Field(default=5)
+        top_k: int = Field(default=10)
         min_hot_results: int = Field(default=3)
         priority: int = Field(default=0)
         enabled: bool = Field(default=True)
@@ -31,6 +31,7 @@ class Pipeline:
         self.type = "filter"
         self.name = "RAG Retrieval"
         self.valves = self.Valves()
+        self._last_sources = []
 
     async def on_startup(self):
         pass
@@ -62,10 +63,12 @@ class Pipeline:
 
         chunks = self._retrieve(query)
         if not chunks:
+            self._last_sources = []
             return body
 
-        # Build context block
+        # Build context block and track sources for outlet
         context_parts = []
+        seen_sources = []
         for i, chunk in enumerate(chunks, 1):
             source = chunk.get("source", "unknown")
             book = chunk.get("book_title", "")
@@ -78,6 +81,13 @@ class Pipeline:
                 label += f", {chapter}"
 
             context_parts.append(f"{label}\n{chunk['text']}")
+
+            # Deduplicate sources for citation footer
+            source_key = (source, book, chapter)
+            if source_key not in seen_sources:
+                seen_sources.append(source_key)
+
+        self._last_sources = seen_sources
 
         context = "\n\n".join(context_parts)
 
@@ -98,6 +108,31 @@ class Pipeline:
             insert_idx = 1
         body["messages"].insert(insert_idx, rag_system)
 
+        return body
+
+    async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+        if not self._last_sources:
+            return body
+
+        messages = body.get("messages", [])
+        if not messages:
+            return body
+
+        # Find the last assistant message and append sources
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                lines = ["\n\n---\n**Sources:**"]
+                for source, book, chapter in self._last_sources:
+                    parts = [f"*{source}*"]
+                    if book:
+                        parts = [f"*{book}*"]
+                    if chapter:
+                        parts.append(chapter)
+                    lines.append(f"- {' — '.join(parts)}")
+                msg["content"] += "\n".join(lines)
+                break
+
+        self._last_sources = []
         return body
 
     def _retrieve(self, query: str) -> list[dict]:

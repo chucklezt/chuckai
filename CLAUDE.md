@@ -97,15 +97,15 @@ The following is fully working and validated:
 - **Tiered collections:** docs_hot (priority) + docs_cold (archive)
 - **Document storage** at `~/documents/inbox/` and `~/documents/inbox_priority/` — symlink-ready for future SATA migration
 - **RAG pipeline** integrated into Open WebUI via Pipelines filter on port 9099
-- **Validated end-to-end** with EPUB (2592 chunks, 85s ingestion) and TXT formats
+- **Source citations** — inline chapter references in responses plus a Sources footer via pipeline outlet
+- **Tuned retrieval** — 1500-char chunks, top_k=10, EPUB boilerplate filtering (TOC, copyright, dedication skipped)
+- **Validated** with *Microservices Patterns* EPUB (895 chunks, 35s ingestion) — model cites specific chapters and passages
 
-### RAG Retrieval Tuning — NEXT
+### Further Improvements — NEXT
 
-Retrieval quality needs improvement. During EPUB testing, 500-char chunks caused TOC fragments to outscore substantive chapter content. Planned fixes:
-- **Increase CHUNK_SIZE** in `ingest/config.py` from 500 to 1500–2000 characters
-- **Increase top_k** in `pipelines/rag_pipeline.py` from 5 to 10
-- **Filter boilerplate** in `ingest/extractor.py` — skip TOC, copyright, dedication, front matter sections during EPUB extraction
 - **Skip processed files** — add a manifest or Qdrant ID check to avoid re-embedding on watcher restart
+- **Relevance threshold** — filter low-scoring chunks to avoid injecting irrelevant context
+- **Corpus scaling** — test with larger document collections to validate on-disk HNSW performance
 
 ### Phase 3 — PLANNED
 

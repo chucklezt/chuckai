@@ -16,8 +16,8 @@ EMBED_DIM = 768
 TIKA_URL = os.getenv("TIKA_URL", "http://localhost:9998")
 
 # Chunking
-CHUNK_SIZE = 500  # characters
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 1500  # characters
+CHUNK_OVERLAP = 150
 
 # BM25 sparse vector
 BM25_K1 = 1.2

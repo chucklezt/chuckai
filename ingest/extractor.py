@@ -55,16 +55,27 @@ def _extract_epub(file_path: str, source: str) -> list[dict]:
     book_title = book.get_metadata("DC", "title")
     book_title = book_title[0][0] if book_title else source
 
+    # Boilerplate section titles to skip
+    skip_titles = {
+        "copyright", "dedication", "table of contents", "contents",
+        "brief table of contents", "about the cover", "about the cover illustration",
+        "title page", "front matter", "half title", "also by",
+    }
+
     sections = []
     for i, item in enumerate(book.get_items_of_type(ebooklib.ITEM_DOCUMENT)):
         soup = BeautifulSoup(item.get_content(), "lxml")
         text = soup.get_text(separator="\n", strip=True)
-        if not text or len(text) < 20:
+        if not text or len(text) < 50:
             continue
 
         # Try to extract chapter title from first heading
         heading = soup.find(["h1", "h2", "h3"])
         chapter_title = heading.get_text(strip=True) if heading else f"Section {i}"
+
+        # Skip boilerplate sections
+        if chapter_title.lower().strip() in skip_titles:
+            continue
 
         sections.append({
             "text": text,
