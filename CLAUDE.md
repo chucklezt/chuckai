@@ -68,7 +68,8 @@ chuckai/
 ├── pipelines/                  # Open WebUI pipeline plugins
 │   └── rag_pipeline.py         # Hybrid BM25 + semantic RAG retrieval filter
 ├── scripts/                    # Utility and maintenance scripts
-│   └── healthcheck.sh          # Full stack health check
+│   ├── healthcheck.sh          # Full stack health check
+│   └── warmup.sh               # Prime cold services after reboot
 └── docs/                       # Architecture and reference documentation
 ```
 
@@ -99,6 +100,7 @@ The following is fully working and validated:
 - **RAG pipeline** integrated into Open WebUI via Pipelines filter on port 9099
 - **Source citations** — inline chapter references in responses plus a Sources footer via pipeline outlet
 - **Tuned retrieval** — 1500-char chunks, top_k=10, EPUB boilerplate filtering (TOC, copyright, dedication skipped)
+- **Pipeline timing logs** — embed, hot search, cold fallback, and total retrieval latency logged per query (visible in `docker logs pipelines`)
 - **Validated** with *Microservices Patterns* EPUB (895 chunks, 35s ingestion) — model cites specific chapters and passages
 
 ### Further Improvements — NEXT
@@ -173,8 +175,10 @@ The order matters — llama.cpp first, then Pipelines. Each URL gets a correspon
 ### 2a. Pipelines must be registered as an OpenAI API connection
 Open WebUI v0.8.12 discovers Pipelines through its OpenAI API connections list, NOT through a separate `PIPELINES_URLS` env var. The `PIPELINES_URLS` and `PIPELINES_API_KEY` env vars do NOT work — Open WebUI can reach the server but the UI shows "Pipelines Not Detected." The fix is to add the Pipelines server URL (`http://localhost:9099`) as a second entry in `OPENAI_API_BASE_URLS` with the default Pipelines API key (`0p3n-w3bu!`) in `OPENAI_API_KEYS`.
 
-### 3. llama.cpp requires --jinja and -rea off for Qwen 3.5
+### 3. llama.cpp requires --jinja, -rea off, and --poll 0 for Qwen 3.5
 Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break Open WebUI's JSON stream parser. The `-rea off` flag disables thinking mode. It only works when `--jinja` is also present. `--reasoning-format none` alone does NOT work — we verified this across multiple llama.cpp builds.
+
+The `--poll 0` flag prevents llama-server from busy-waiting on a CPU core at 100% while idle. Without it, the main thread spins constantly polling for requests. This has no impact on generation performance.
 
 ### 4. SearXNG must use port mapping, not network_mode: host
 SearXNG always binds internally to port 8080 regardless of settings.yml. Use `ports: "8081:8080"` in docker-compose. Do not use `network_mode: host` for SearXNG — it will collide with llama-server on 8080.
@@ -210,20 +214,27 @@ The Open WebUI Pipelines Docker image (`ghcr.io/open-webui/pipelines:main`) requ
 ### Start everything (after reboot)
 ```bash
 # 1. Start llama.cpp
-bash ~/start-llama-qwe359.sh &
+bash ~/start-llama-qwen.sh &
 sleep 15 && curl -s http://localhost:8080/health
 
 # 2. Start Docker services
 cd ~ && docker compose up -d
+
+# 3. Warm up cold services (Ollama embeddings, Qdrant indexes, llama-server)
+sleep 10 && bash ~/chuckai/scripts/warmup.sh
 ```
 
 ### Switch models
 ```bash
-# Switch to 27B
-pkill -9 llama-server && sleep 3 && bash ~/start-llama-27b.sh &
+# Switch to 27B (repoint symlink + restart)
+pkill -9 llama-server
+ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
+sleep 3 && bash ~/start-llama-qwen.sh &
 
 # Switch back to 9B
-pkill -9 llama-server && sleep 3 && bash ~/start-llama-qwe359.sh &
+pkill -9 llama-server
+ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+sleep 3 && bash ~/start-llama-qwen.sh &
 
 # Check which model is loaded
 curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])"
@@ -231,8 +242,8 @@ curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(jso
 
 ### Convenience aliases (in ~/.bashrc)
 ```bash
-alias model-9b='pkill -9 llama-server; sleep 3; bash ~/start-llama-qwe359.sh & echo "Starting 9B..."'
-alias model-27b='pkill -9 llama-server; sleep 3; bash ~/start-llama-27b.sh & echo "Starting 27B..."'
+alias model-9b='pkill -9 llama-server; sleep 3; ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh & echo "Starting 9B..."'
+alias model-27b='pkill -9 llama-server; sleep 3; ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh & echo "Starting 27B..."'
 alias model-status='curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])"'
 ```
 
@@ -335,6 +346,8 @@ All ingestion code, SFTP config, and file watchers reference `~/documents/` and 
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| llama-server 100% CPU at idle | Busy-wait polling | Add `--poll 0` to startup script |
+| Slow first query after reboot | Cold Ollama/Qdrant caches | Run `bash ~/chuckai/scripts/warmup.sh` after startup |
 | "Expecting value: line 1 column 1" | Qwen think tags in stream | Confirm `-rea off` and `--jinja` in startup script |
 | "Model not found :latest" | OLLAMA_BASE_URL set | Use OPENAI_API_BASE_URL=http://localhost:8080/v1 |
 | "Open WebUI Backend Required" | Browser cache mismatch | Cmd+Shift+R or open private window |

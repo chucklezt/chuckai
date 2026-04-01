@@ -18,4 +18,5 @@ cd /home/chuck/llama.cpp
   --host 0.0.0.0 \
   --port 8080 \
   --jinja \
-  -rea off > ~/llama.log 2>&1
+  -rea off \
+  --poll 0 > ~/llama.log 2>&1

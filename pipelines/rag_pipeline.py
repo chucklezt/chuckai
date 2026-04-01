@@ -5,10 +5,14 @@ version: 0.1.0
 description: Hybrid BM25 + semantic retrieval from Qdrant with RRF fusion. Queries docs_hot first, falls back to docs_cold.
 """
 
+import logging
 import math
 import re
+import time
 from collections import Counter
 from typing import List, Optional
+
+log = logging.getLogger("rag_pipeline")
 
 import requests
 from pydantic import BaseModel, Field
@@ -61,7 +65,13 @@ class Pipeline:
         if not query or len(query) < 3:
             return body
 
+        t0 = time.perf_counter()
         chunks = self._retrieve(query)
+        retrieval_ms = (time.perf_counter() - t0) * 1000
+        log.info(
+            "inlet: query=%d chars, %d chunks retrieved in %.0f ms",
+            len(query), len(chunks), retrieval_ms,
+        )
         if not chunks:
             self._last_sources = []
             return body
@@ -137,17 +147,27 @@ class Pipeline:
 
     def _retrieve(self, query: str) -> list[dict]:
         """Query docs_hot first, fall back to docs_cold if < min_hot_results."""
+        t0 = time.perf_counter()
         dense = self._embed(query)
+        embed_ms = (time.perf_counter() - t0) * 1000
         sparse = self._sparse_vector(query)
         if not dense:
+            log.warning("embed failed after %.0f ms", embed_ms)
             return []
 
+        t1 = time.perf_counter()
         results = self._search(self.valves.collection_hot, dense, sparse)
+        hot_ms = (time.perf_counter() - t1) * 1000
+        log.info("search hot: %d results in %.0f ms", len(results), hot_ms)
 
         if len(results) < self.valves.min_hot_results:
+            t2 = time.perf_counter()
             cold = self._search(self.valves.collection_cold, dense, sparse)
+            cold_ms = (time.perf_counter() - t2) * 1000
+            log.info("search cold (fallback): %d results in %.0f ms", len(cold), cold_ms)
             results.extend(cold)
 
+        log.info("retrieve total: embed=%.0f ms, %d results", embed_ms, len(results))
         return results[: self.valves.top_k]
 
     def _search(self, collection: str, dense: list, sparse: dict) -> list[dict]:

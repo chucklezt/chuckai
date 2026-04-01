@@ -151,6 +151,8 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Pipelines server registered as an OpenAI API connection (not a separate Pipelines URL)
 - Inline source citations and chapter references in model responses, with a Sources footer listing all retrieved documents
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
+- Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
+- Post-boot warmup script to prime Ollama embeddings, Qdrant indexes, and llama-server KV cache
 
 ### Phase 3 — Planned
 
@@ -225,6 +227,14 @@ cd ~ && docker compose up -d
 sleep 10 && curl -s http://localhost:3000/api/version
 # Expected: {"version":"0.8.12"}
 ```
+
+### 6a. Warm up services (optional but recommended)
+
+```bash
+bash ~/chuckai/scripts/warmup.sh
+```
+
+Primes Ollama embedding model, Qdrant HNSW indexes, and llama-server KV cache. Eliminates cold-start latency on the first query after reboot.
 
 ### 7. Configure web search
 
