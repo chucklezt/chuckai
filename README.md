@@ -227,14 +227,17 @@ The startup script sequences all services in dependency order with health checks
 
 **Startup sequence:**
 
-1. Kill existing llama-server, `docker compose down`, restart Ollama
-2. Start llama-server → wait for model load
-3. Start infrastructure (Qdrant, Tika, SearXNG) → wait for each
-4. Start Pipelines (needs Ollama + Qdrant) → wait for health
-5. Start Open WebUI (needs Pipelines for filter discovery) → wait for health
-6. Warmup all caches (Ollama embed, Qdrant HNSW indexes, llama-server)
+| Step | Service | Why this order |
+|---|---|---|
+| 1 | Kill everything | Clean slate — kill llama-server, docker compose down |
+| 2 | Ollama (systemd) | Needed by Pipelines for embeddings |
+| 3 | llama-server | GPU inference. Wait for model load (up to 60s) |
+| 4 | Qdrant, Tika, SearXNG | Infrastructure for RAG and web search |
+| 5 | Warmup (Ollama, Qdrant, llama-server) | Prime cold caches with auto-retry if Ollama hangs |
+| 6 | Pipelines | RAG filter. Needs warm Ollama + ready Qdrant |
+| 7 | Open WebUI | Must discover Pipelines filter on startup |
 
-**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, RAG silently stops working. The startup script prevents this.
+**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, RAG silently stops working. Ollama can hang after llama-server restarts — the warmup step catches this with a 60s timeout and auto-restarts Ollama before Pipelines depends on it.
 
 **Health check endpoints:**
 

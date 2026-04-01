@@ -248,14 +248,20 @@ The startup script (`scripts/startup.sh`) sequences all services in dependency o
 
 **Startup sequence:**
 
-1. Kill existing llama-server, `docker compose down`, restart Ollama → wait for Ollama health
-2. Start llama-server → wait for health
-3. Start infrastructure (Qdrant, Tika, SearXNG) → wait for each
-4. Start Pipelines (needs Ollama + Qdrant) → wait for health
-5. Start Open WebUI (needs Pipelines for filter discovery) → wait for health
-6. Warmup all caches (Ollama embed, Qdrant HNSW indexes, llama-server)
+| Step | Service | Why this order |
+|---|---|---|
+| 1 | Kill everything | Clean slate — kill llama-server, docker compose down |
+| 2 | Ollama (systemd) | Needed by Pipelines for embeddings. Must start before llama-server to avoid hang |
+| 3 | llama-server | GPU inference. Wait for model load (up to 60s) |
+| 4 | Qdrant, Tika, SearXNG | Infrastructure for RAG and web search |
+| 5 | Warmup (Ollama, Qdrant, llama-server) | Prime cold caches. Catches Ollama hang with 60s timeout + auto-retry before Pipelines starts |
+| 6 | Pipelines | RAG filter. Needs warm Ollama + ready Qdrant |
+| 7 | Open WebUI | Must discover Pipelines filter on startup |
 
-**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, the filter is never registered and RAG silently stops working. The only fix is restarting both containers. The startup script prevents this by ensuring Pipelines is healthy before Open WebUI starts.
+**Why the order matters:**
+- Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, the filter is never registered and RAG silently stops working. The only fix is restarting both containers.
+- Ollama can hang indefinitely after llama-server restarts (resource contention). The warmup step (5) tests Ollama with a 60s timeout and auto-restarts it if it hangs, before Pipelines depends on it.
+- Warmup runs before Pipelines/Open WebUI so the first user prompt doesn't hit cold caches.
 
 **Health check endpoints:**
 

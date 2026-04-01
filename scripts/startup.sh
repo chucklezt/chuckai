@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full ChuckAI stack startup — run manually after reboot
+# Full ChuckAI stack startup — run manually after reboot or for clean restart
 # Sequences services in dependency order with health checks between stages
 
 set -e
@@ -40,29 +40,30 @@ wait_for_pipelines() {
   fail "Pipelines did not respond after ${max}s — aborting"
 }
 
-# ── Step 1: Kill existing services ──
+# ── Step 1: Kill everything ──
+log "Stopping all services..."
 if pgrep -f llama-server > /dev/null; then
   log "Killing existing llama-server..."
-  pkill -9 -f llama-server
+  kill -9 $(pgrep -f llama-server) 2>/dev/null || true
   sleep 2
 fi
 
-log "Stopping Docker services..."
-cd /home/chuck && docker compose down
+cd /home/chuck && docker compose down 2>/dev/null || true
 sleep 2
 
+# ── Step 2: Ollama (systemd service, needed by Pipelines for embeddings) ──
 log "Restarting Ollama..."
 sudo systemctl restart ollama
 sleep 2
 wait_for "Ollama" "http://localhost:11434/api/version" 30
 
-# ── Step 2: llama-server ──
+# ── Step 3: llama-server (GPU inference, independent of Docker services) ──
 log "Starting llama-server..."
 bash ~/start-llama-qwen.sh &
 sleep 2
 wait_for "llama-server" "http://localhost:8080/health" 60
 
-# ── Step 3: Infrastructure services (Qdrant, Tika, SearXNG) ──
+# ── Step 4: Infrastructure services (Qdrant, Tika, SearXNG) ──
 log "Starting infrastructure services..."
 cd /home/chuck && docker compose up -d qdrant tika searxng
 sleep 3
@@ -71,23 +72,24 @@ wait_for "Qdrant" "http://localhost:6333/healthz" 30
 wait_for "Tika" "http://localhost:9998/tika" 30
 wait_for "SearXNG" "http://localhost:8081" 30
 
-# ── Step 4: Pipelines (needs Ollama + Qdrant) ──
-log "Starting Pipelines..."
-cd /home/chuck && docker compose up -d pipelines
-sleep 3
-wait_for_pipelines 30
-
-# ── Step 5: Open WebUI (needs Pipelines for filter discovery) ──
-log "Starting Open WebUI..."
-cd /home/chuck && docker compose up -d open-webui
-sleep 3
-wait_for "Open WebUI" "http://localhost:3000" 30
-
-# ── Step 6: Warmup — prime cold caches ──
+# ── Step 5: Warmup — prime cold caches before Pipelines/WebUI start ──
+# Ollama embed must be warm before Pipelines serves its first RAG request.
+# If Ollama hangs here (known issue after llama-server restart), the script
+# will fail visibly rather than leaving the stack in a broken state.
 log "Warming up Ollama embeddings..."
-curl -sf http://localhost:11434/api/embed \
-  -d '{"model":"nomic-embed-text:v1.5","input":"warmup"}' > /dev/null 2>&1
-log "Ollama embed warm"
+if curl -sf --max-time 60 http://localhost:11434/api/embed \
+  -d '{"model":"nomic-embed-text:v1.5","input":"warmup"}' > /dev/null 2>&1; then
+  log "Ollama embed warm"
+else
+  warn "Ollama embed failed — restarting Ollama and retrying..."
+  sudo systemctl restart ollama
+  sleep 3
+  wait_for "Ollama" "http://localhost:11434/api/version" 30
+  curl -sf --max-time 60 http://localhost:11434/api/embed \
+    -d '{"model":"nomic-embed-text:v1.5","input":"warmup"}' > /dev/null 2>&1 \
+    || fail "Ollama embed still failing after restart"
+  log "Ollama embed warm (after retry)"
+fi
 
 log "Warming up Qdrant indexes..."
 for col in docs_hot docs_cold; do
@@ -98,10 +100,22 @@ done
 log "Qdrant indexes loaded"
 
 log "Warming up llama-server..."
-curl -sf http://localhost:8080/v1/chat/completions \
+curl -sf --max-time 30 http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen-active.gguf","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' > /dev/null 2>&1
 log "llama-server warm"
+
+# ── Step 6: Pipelines (needs Ollama warm + Qdrant ready) ──
+log "Starting Pipelines..."
+cd /home/chuck && docker compose up -d pipelines
+sleep 3
+wait_for_pipelines 30
+
+# ── Step 7: Open WebUI (needs Pipelines for filter discovery) ──
+log "Starting Open WebUI..."
+cd /home/chuck && docker compose up -d open-webui
+sleep 3
+wait_for "Open WebUI" "http://localhost:3000" 30
 
 # ── Done ──
 echo ""
