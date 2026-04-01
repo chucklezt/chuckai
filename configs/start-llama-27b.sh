@@ -18,4 +18,5 @@ cd /home/chuck/llama.cpp
   --port 8080 \
   --jinja \
   -rea off \
-  --poll 0 > ~/llama-27b.log 2>&1
+  --poll 0 \
+  --no-cache-prompt > ~/llama-27b.log 2>&1

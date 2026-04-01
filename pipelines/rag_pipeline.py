@@ -209,7 +209,8 @@ class Pipeline:
             )
             resp.raise_for_status()
             return resp.json()["embeddings"][0]
-        except Exception:
+        except Exception as e:
+            log.error("embed error: %s (query len=%d)", e, len(query))
             return []
 
     @staticmethod

@@ -153,6 +153,7 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
 - Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
 - Post-boot warmup script to prime Ollama embeddings, Qdrant indexes, and llama-server KV cache
+- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin
 
 ### Phase 3 — Planned
 
@@ -450,6 +451,9 @@ grep "offload" ~/llama.log | head -5                  # confirm GPU layers at st
 
 ### Phase 2 — RAG Stack ✓
 Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading via file watcher — drop files into `~/documents/inbox/` or `~/documents/inbox_priority/` and they're indexed automatically. RAG retrieval wired into Open WebUI via a Pipelines filter that intercepts every chat query. End-to-end validated with EPUB, TXT, and structured queries.
+
+### Performance Tuning ✓
+Full-stack latency profiling (Open WebUI → Pipelines → Ollama/Qdrant → llama-server) identified prompt caching as the primary bottleneck. Qwen 3.5's hybrid Mamba/attention architecture forces llama-server to reprocess every prompt from scratch — the cache was being written and immediately invalidated, with save times escalating to 160 seconds per request. Disabled with `--no-cache-prompt`. Additional fixes: `--poll 0` for idle CPU spin, warmup script for cold-start latency, and improved error logging in the RAG pipeline.
 
 ### Next — Further Improvements
 - **Skip already-processed files** in the watcher to avoid redundant re-embedding on restart

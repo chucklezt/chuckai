@@ -109,6 +109,18 @@ The following is fully working and validated:
 - **Relevance threshold** — filter low-scoring chunks to avoid injecting irrelevant context
 - **Corpus scaling** — test with larger document collections to validate on-disk HNSW performance
 
+### Performance Tuning — COMPLETE ✓ (2026-04-01)
+
+Debug session traced full request latency through the stack (Open WebUI → Pipelines → Ollama/Qdrant → llama-server). Findings:
+
+- **RAG retrieval is fast** — 28-96ms total (embed ~28-69ms warm, Qdrant search ~3ms). Not a bottleneck.
+- **Generation speed is consistent** — ~49 tok/s on RX 6800 XT across all prompt sizes.
+- **Prompt cache was the bottleneck** — Qwen 3.5's hybrid Mamba/attention architecture invalidates KV cache on every request. llama-server was writing cache entries (growing to 1.3+ GB) then discarding them. Cache save time escalated from 40ms to 160 seconds over a session, blocking between requests. Fixed with `--no-cache-prompt`.
+- **Idle CPU spin** — llama-server busy-waits at 100% on one core without `--poll 0`. Fixed.
+- **Cold start latency** — first Ollama embed after reboot takes ~750ms vs ~28ms warm. Fixed with `scripts/warmup.sh`.
+- **Ollama can become unresponsive** — observed Ollama embed hanging indefinitely (30s timeout) after llama-server restarts. Fixed by restarting Ollama (`sudo systemctl restart ollama`). Root cause unclear; may be related to resource contention during llama-server startup.
+- **Pipelines filter can disconnect** — after restarting llama-server, Open WebUI may stop routing through the Pipelines filter. Fix: `docker compose restart pipelines open-webui`.
+
 ### Phase 3 — PLANNED
 
 - Pandoc + LibreOffice for DOCX/PPTX/PDF output generation
@@ -175,10 +187,12 @@ The order matters — llama.cpp first, then Pipelines. Each URL gets a correspon
 ### 2a. Pipelines must be registered as an OpenAI API connection
 Open WebUI v0.8.12 discovers Pipelines through its OpenAI API connections list, NOT through a separate `PIPELINES_URLS` env var. The `PIPELINES_URLS` and `PIPELINES_API_KEY` env vars do NOT work — Open WebUI can reach the server but the UI shows "Pipelines Not Detected." The fix is to add the Pipelines server URL (`http://localhost:9099`) as a second entry in `OPENAI_API_BASE_URLS` with the default Pipelines API key (`0p3n-w3bu!`) in `OPENAI_API_KEYS`.
 
-### 3. llama.cpp requires --jinja, -rea off, and --poll 0 for Qwen 3.5
+### 3. llama.cpp requires --jinja, -rea off, --poll 0, and --no-cache-prompt for Qwen 3.5
 Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break Open WebUI's JSON stream parser. The `-rea off` flag disables thinking mode. It only works when `--jinja` is also present. `--reasoning-format none` alone does NOT work — we verified this across multiple llama.cpp builds.
 
 The `--poll 0` flag prevents llama-server from busy-waiting on a CPU core at 100% while idle. Without it, the main thread spins constantly polling for requests. This has no impact on generation performance.
+
+The `--no-cache-prompt` flag disables prompt caching. Qwen 3.5 uses a hybrid attention + Mamba/SSM architecture, and llama-server **cannot reuse cached KV state** for hybrid models — every request triggers `forcing full prompt re-processing due to lack of cache data`. Without this flag, llama-server still writes cache entries (growing to 1+ GB in RAM) and the save operation between requests escalates from 40ms to 38–160 seconds as the cache grows, blocking subsequent requests. With `--no-cache-prompt`, cache updates stay under 100ms. If you switch to a pure-transformer model (e.g. Llama, Mistral), re-enable prompt caching.
 
 ### 4. SearXNG must use port mapping, not network_mode: host
 SearXNG always binds internally to port 8080 regardless of settings.yml. Use `ports: "8081:8080"` in docker-compose. Do not use `network_mode: host` for SearXNG — it will collide with llama-server on 8080.
@@ -347,7 +361,10 @@ All ingestion code, SFTP config, and file watchers reference `~/documents/` and 
 | Symptom | Cause | Fix |
 |---|---|---|
 | llama-server 100% CPU at idle | Busy-wait polling | Add `--poll 0` to startup script |
+| Multi-turn chat gets progressively slower | Prompt cache growing, saves take 40-160s | Add `--no-cache-prompt` (required for Qwen 3.5 hybrid arch) |
 | Slow first query after reboot | Cold Ollama/Qdrant caches | Run `bash ~/chuckai/scripts/warmup.sh` after startup |
+| Ollama embed hangs (30s timeout) | Ollama unresponsive after restarts | `sudo systemctl restart ollama` |
+| RAG not triggering after restart | Pipelines filter disconnected | `docker compose restart pipelines open-webui` |
 | "Expecting value: line 1 column 1" | Qwen think tags in stream | Confirm `-rea off` and `--jinja` in startup script |
 | "Model not found :latest" | OLLAMA_BASE_URL set | Use OPENAI_API_BASE_URL=http://localhost:8080/v1 |
 | "Open WebUI Backend Required" | Browser cache mismatch | Cmd+Shift+R or open private window |
