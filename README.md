@@ -234,6 +234,42 @@ Open `http://192.168.1.59:3000` → Admin Panel → Settings → Web Search:
 
 The globe icon will appear in the chat input bar. Click it to enable web-augmented responses.
 
+### 8. Set up RAG ingestion
+
+```bash
+# Create document directories
+mkdir -p ~/documents/inbox ~/documents/inbox_priority
+
+# Start Ollama and pull the embedding model
+sudo systemctl enable ollama && sudo systemctl start ollama
+ollama pull nomic-embed-text
+
+# Create Python venv and install dependencies
+cd ~/chuckai
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r ingest/requirements.txt
+
+# Start the file watcher (processes existing files, then watches for new ones)
+.venv/bin/python -m ingest.watcher
+```
+
+Drop files into `~/documents/inbox_priority/` (queried first) or `~/documents/inbox/` (fallback archive). Supported formats: PDF, DOCX, PPTX, XLSX, EPUB, HTML, TXT, Markdown, CSV, JSON.
+
+### 9. Verify Pipelines connection
+
+The Pipelines server (RAG filter) is started automatically by `docker compose up -d`. The connection to Open WebUI is configured via environment variables in `docker-compose.yml`:
+
+```yaml
+- OPENAI_API_BASE_URLS=http://localhost:8080/v1;http://localhost:9099
+- OPENAI_API_KEYS=dummy;0p3n-w3bu!
+```
+
+**Important:** The Pipelines server must be registered as a second OpenAI API connection using the semicolon-separated `OPENAI_API_BASE_URLS` and `OPENAI_API_KEYS` variables. Do NOT use `PIPELINES_URLS` or `PIPELINES_API_KEY` — Open WebUI v0.8.12 ignores these and the Admin Panel will show "Pipelines Not Detected." The default Pipelines API key is `0p3n-w3bu!`.
+
+Verify in the Admin Panel → Settings → Pipelines — you should see the "RAG Retrieval" filter listed.
+
 ---
 
 ## Service Management
