@@ -53,6 +53,15 @@ def _merge_splits(parts: list[str], sep: str, size: int, overlap: int) -> list[s
     current_len = 0
 
     for part in parts:
+        # If a single part exceeds size, split it with the next separator level
+        if len(part) > size:
+            if current:
+                chunks.append(sep.join(current))
+                current = []
+                current_len = 0
+            chunks.extend(_split_recursive(part, size, overlap))
+            continue
+
         part_len = len(part) + (len(sep) if current else 0)
 
         if current_len + part_len > size and current:

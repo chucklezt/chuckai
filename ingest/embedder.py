@@ -99,10 +99,15 @@ def _embed_batch(texts: list[str]) -> list[list[float]]:
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
         for text in batch:
+            # Truncate to 8192 tokens (~32K chars) — nomic-embed-text context limit
+            truncated = text[:32000] if len(text) > 32000 else text
+            if not truncated.strip():
+                all_embeddings.append([0.0] * EMBED_DIM)
+                continue
             resp = requests.post(
                 f"{OLLAMA_URL}/api/embed",
-                json={"model": EMBED_MODEL, "input": text},
-                timeout=30,
+                json={"model": EMBED_MODEL, "input": truncated},
+                timeout=60,
             )
             resp.raise_for_status()
             all_embeddings.append(resp.json()["embeddings"][0])

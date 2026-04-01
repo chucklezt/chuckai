@@ -149,6 +149,7 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Symlink-based document storage (`~/documents/`) — starts on NVMe, migrates to dedicated SATA drive with a single `ln -sf`
 - RAG retrieval integrated into Open WebUI via Pipelines filter — every chat query searches the knowledge base
 - Pipelines server registered as an OpenAI API connection (not a separate Pipelines URL)
+- End-to-end validated with EPUB ingestion (2592 chunks from *Microservices Patterns* by Chris Richardson, 85s ingestion at 33ms/chunk)
 
 ### Phase 3 — Planned
 
@@ -437,7 +438,14 @@ grep "offload" ~/llama.log | head -5                  # confirm GPU layers at st
 ## Roadmap
 
 ### Phase 2 — RAG Stack ✓
-Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading via file watcher — drop files into `~/documents/inbox/` or `~/documents/inbox_priority/` and they're indexed automatically. RAG retrieval wired into Open WebUI via a Pipelines filter that intercepts every chat query.
+Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading via file watcher — drop files into `~/documents/inbox/` or `~/documents/inbox_priority/` and they're indexed automatically. RAG retrieval wired into Open WebUI via a Pipelines filter that intercepts every chat query. End-to-end validated with EPUB, TXT, and structured queries.
+
+### Next — RAG Retrieval Tuning
+The pipeline is functional but retrieval quality needs tuning. Current 500-character chunks are too small for substantive book content — table-of-contents fragments outscore actual chapter text. Planned improvements:
+- **Increase chunk size** to 1500–2000 characters so each chunk carries enough context for meaningful retrieval
+- **Increase top_k** from 5 to 10 to retrieve a wider set of candidate passages
+- **Filter boilerplate sections** during extraction (TOC, copyright, dedication, front matter) to reduce noise in the index
+- **Skip already-processed files** in the watcher to avoid redundant re-embedding on restart
 
 ### Phase 3 — Document Output
 On-demand generation of Word documents, PowerPoint presentations, and PDFs from model output. Pandoc + LibreOffice conversion triggered by natural language requests in chat.

@@ -1,10 +1,13 @@
 """Document text extraction via Apache Tika and ebooklib."""
 
 import os
+import warnings
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 import ebooklib
 from ebooklib import epub
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 from .config import TIKA_URL, TIKA_EXTENSIONS, EPUB_EXTENSION
 
