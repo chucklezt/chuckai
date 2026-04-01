@@ -98,18 +98,21 @@ def _embed_batch(texts: list[str]) -> list[list[float]]:
 
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
-        for text in batch:
-            # Truncate to 8192 tokens (~32K chars) — nomic-embed-text context limit
-            truncated = text[:32000] if len(text) > 32000 else text
-            if not truncated.strip():
-                all_embeddings.append([0.0] * EMBED_DIM)
-                continue
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/embed",
-                json={"model": EMBED_MODEL, "input": truncated},
-                timeout=60,
-            )
-            resp.raise_for_status()
-            all_embeddings.append(resp.json()["embeddings"][0])
+        # Truncate to 8192 tokens (~32K chars) — nomic-embed-text context limit
+        truncated = [t[:32000] if len(t) > 32000 else t for t in batch]
+        # Replace empty strings with a placeholder to avoid API errors
+        cleaned = [t if t.strip() else "empty" for t in truncated]
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": EMBED_MODEL, "input": cleaned},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        embeddings = resp.json()["embeddings"]
+        # Zero out embeddings for originally empty texts
+        for j, t in enumerate(truncated):
+            if not t.strip():
+                embeddings[j] = [0.0] * EMBED_DIM
+        all_embeddings.extend(embeddings)
 
     return all_embeddings

@@ -23,11 +23,12 @@ class Pipeline:
         pipelines: List[str] = ["*"]
         qdrant_url: str = Field(default="http://localhost:6333")
         ollama_url: str = Field(default="http://localhost:11434")
-        embed_model: str = Field(default="nomic-embed-text")
+        embed_model: str = Field(default="nomic-embed-text:v1.5")
         collection_hot: str = Field(default="docs_hot")
         collection_cold: str = Field(default="docs_cold")
         top_k: int = Field(default=10)
         min_hot_results: int = Field(default=3)
+        score_threshold: float = Field(default=0.5)
         priority: int = Field(default=0)
         enabled: bool = Field(default=True)
 
@@ -36,6 +37,7 @@ class Pipeline:
         self.name = "RAG Retrieval"
         self.valves = self.Valves()
         self._last_sources = []
+        self._web_search = False
 
     async def on_startup(self):
         pass
@@ -64,6 +66,27 @@ class Pipeline:
         query = user_msg.get("content", "")
         if not query or len(query) < 3:
             return body
+
+        # Skip Open WebUI internal tasks (title generation, tag generation, etc.)
+        if query.lstrip().startswith("### Task:"):
+            return body
+
+        # Detect web search — Open WebUI injects search results into messages
+        self._web_search = any(
+            "search results" in str(m.get("content", "")).lower()
+            or "web_search" in str(m.get("metadata", {}))
+            for m in messages
+        )
+
+        # Only use the last user turn for RAG — Open WebUI may pack conversation
+        # history into a single message, causing irrelevant matches against
+        # previous assistant responses
+        if len(query) > 500:
+            lines = [l.strip() for l in query.split("\n") if l.strip()]
+            if lines:
+                query = lines[-1]
+            if len(query) > 500:
+                query = query[:500]
 
         t0 = time.perf_counter()
         chunks = self._retrieve(query)
@@ -106,8 +129,9 @@ class Pipeline:
             "content": (
                 "The following document excerpts were retrieved from the user's "
                 "personal knowledge base. Use them to inform your answer when relevant. "
-                "Cite sources by name when you use them. If the excerpts don't help "
-                "answer the question, rely on your own knowledge and say so.\n\n"
+                "Cite sources by name when you use them. If the excerpts are not "
+                "relevant to the question, ignore them entirely and answer using your "
+                "own knowledge. Do not mention or describe the excerpts.\n\n"
                 f"--- Retrieved Context ---\n{context}\n--- End Context ---"
             ),
         }
@@ -121,28 +145,65 @@ class Pipeline:
         return body
 
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        if not self._last_sources:
-            return body
-
         messages = body.get("messages", [])
         if not messages:
+            self._last_sources = []
+            self._web_search = False
             return body
 
-        # Find the last assistant message and append sources
+        # Find the last assistant message
         for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                lines = ["\n\n---\n**Sources:**"]
-                for source, book, chapter in self._last_sources:
-                    parts = [f"*{source}*"]
-                    if book:
-                        parts = [f"*{book}*"]
-                    if chapter:
-                        parts.append(chapter)
-                    lines.append(f"- {' — '.join(parts)}")
-                msg["content"] += "\n".join(lines)
+            if msg.get("role") == "assistant" and msg.get("content"):
+                # Determine response mode and build footer
+                has_rag = bool(self._last_sources)
+                has_web = self._web_search
+
+                # Check if model actually used RAG context
+                rag_used = False
+                if has_rag:
+                    content = msg["content"].lower()
+                    skip_phrases = [
+                        "do not contain",
+                        "don't contain",
+                        "no information",
+                        "not relevant",
+                        "not related",
+                        "rely on my own",
+                        "own knowledge",
+                        "no relevant",
+                    ]
+                    rag_used = not any(phrase in content for phrase in skip_phrases)
+
+                # Build mode tag
+                modes = []
+                if rag_used:
+                    modes.append("RAG")
+                if has_web:
+                    modes.append("Web")
+                if not modes:
+                    modes.append("LLM")
+                mode_tag = " + ".join(modes)
+
+                # Build footer
+                footer = f"\n\n---\n`{mode_tag}`"
+
+                # Append RAG sources if used
+                if rag_used:
+                    lines = ["\n**Sources:**"]
+                    for source, book, chapter in self._last_sources:
+                        parts = [f"*{source}*"]
+                        if book:
+                            parts = [f"*{book}*"]
+                        if chapter:
+                            parts.append(chapter)
+                        lines.append(f"- {' — '.join(parts)}")
+                    footer += "\n".join(lines)
+
+                msg["content"] += footer
                 break
 
         self._last_sources = []
+        self._web_search = False
         return body
 
     def _retrieve(self, query: str) -> list[dict]:
@@ -167,35 +228,82 @@ class Pipeline:
             log.info("search cold (fallback): %d results in %.0f ms", len(cold), cold_ms)
             results.extend(cold)
 
-        log.info("retrieve total: embed=%.0f ms, %d results", embed_ms, len(results))
+        scores = [r.get("_score", 0) for r in results] or [0]
+        log.info(
+            "retrieve total: embed=%.0f ms, %d results above threshold %.2f (scores: %.3f–%.3f)",
+            embed_ms, len(results), self.valves.score_threshold,
+            min(scores), max(scores),
+        )
         return results[: self.valves.top_k]
 
     def _search(self, collection: str, dense: list, sparse: dict) -> list[dict]:
-        """Hybrid search with RRF fusion via Qdrant REST API."""
+        """Hybrid search: dense similarity for scoring + sparse BM25 for boosting.
+
+        Uses dense search with score_threshold to filter by actual cosine
+        similarity (not RRF rank scores which are always 0.5/0.333/etc).
+        Then re-ranks using RRF fusion with sparse results for better ordering.
+        """
         try:
-            resp = requests.post(
+            # Dense search with real cosine similarity scores
+            dense_resp = requests.post(
                 f"{self.valves.qdrant_url}/collections/{collection}/points/query",
                 json={
-                    "prefetch": [
-                        {"query": dense, "using": "dense", "limit": 20},
-                        {
-                            "query": {
-                                "indices": sparse["indices"],
-                                "values": sparse["values"],
-                            },
-                            "using": "sparse",
-                            "limit": 20,
-                        },
-                    ],
-                    "query": {"fusion": "rrf"},
+                    "query": dense,
+                    "using": "dense",
                     "limit": self.valves.top_k,
+                    "score_threshold": self.valves.score_threshold,
                     "with_payload": True,
                 },
                 timeout=10,
             )
-            resp.raise_for_status()
-            points = resp.json().get("result", {}).get("points", [])
-            return [pt["payload"] for pt in points if pt.get("payload")]
+            dense_resp.raise_for_status()
+            dense_points = dense_resp.json().get("result", {}).get("points", [])
+
+            if not dense_points:
+                return []
+
+            # Also run sparse search for RRF re-ranking
+            sparse_resp = requests.post(
+                f"{self.valves.qdrant_url}/collections/{collection}/points/query",
+                json={
+                    "query": {
+                        "indices": sparse["indices"],
+                        "values": sparse["values"],
+                    },
+                    "using": "sparse",
+                    "limit": 20,
+                    "with_payload": True,
+                },
+                timeout=10,
+            )
+            sparse_resp.raise_for_status()
+            sparse_points = sparse_resp.json().get("result", {}).get("points", [])
+
+            # RRF fusion: combine rankings from dense + sparse
+            rrf_k = 60
+            scores = {}
+            payloads = {}
+            for rank, pt in enumerate(dense_points):
+                pid = pt["id"]
+                scores[pid] = scores.get(pid, 0) + 1.0 / (rrf_k + rank + 1)
+                payloads[pid] = pt.get("payload", {})
+                payloads[pid]["_dense_score"] = pt.get("score", 0)
+            for rank, pt in enumerate(sparse_points):
+                pid = pt["id"]
+                scores[pid] = scores.get(pid, 0) + 1.0 / (rrf_k + rank + 1)
+                if pid not in payloads:
+                    payloads[pid] = pt.get("payload", {})
+
+            # Only return points that passed the dense threshold
+            ranked = sorted(
+                [(pid, s) for pid, s in scores.items() if pid in {p["id"] for p in dense_points}],
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            return [
+                {**payloads[pid], "_score": payloads[pid].get("_dense_score", 0)}
+                for pid, _ in ranked
+            ]
         except Exception:
             return []
 

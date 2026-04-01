@@ -8,7 +8,7 @@ echo "Warming up services..."
 printf "  Ollama embed... "
 t=$(date +%s%N)
 curl -sf http://localhost:11434/api/embed \
-  -d '{"model":"nomic-embed-text","input":"warmup"}' > /dev/null 2>&1
+  -d '{"model":"nomic-embed-text:v1.5","input":"warmup"}' > /dev/null 2>&1
 ms=$(( ($(date +%s%N) - t) / 1000000 ))
 echo "${ms} ms"
 

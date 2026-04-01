@@ -36,7 +36,7 @@ The stack is intentionally positioned as the on-premises counterpart to the GCP-
 | SearXNG | 2026.3.18-3810dc9d1 |
 | Docker CE | 29.3.0 |
 | Docker Compose | v5.1.0 |
-| Ollama | 0.18.2 (running — nomic-embed-text for RAG embeddings) |
+| Ollama | 0.18.2 (running — nomic-embed-text:v1.5 for RAG embeddings) |
 | Open WebUI Pipelines | main (ghcr.io/open-webui/pipelines:main) |
 | ROCm SMI | 3.0.0+55c0f58 |
 | Python | 3.10.12 |
@@ -69,6 +69,7 @@ chuckai/
 │   └── rag_pipeline.py         # Hybrid BM25 + semantic RAG retrieval filter
 ├── scripts/                    # Utility and maintenance scripts
 │   ├── healthcheck.sh          # Full stack health check
+│   ├── startup.sh              # Sequenced full-stack start/restart with health checks
 │   └── warmup.sh               # Prime cold services after reboot
 └── docs/                       # Architecture and reference documentation
 ```
@@ -91,7 +92,7 @@ The following is fully working and validated:
 
 - **Qdrant** vector database on port 6333 — on-disk HNSW, on-disk payload
 - **Apache Tika** document parsing on port 9998
-- **Ollama** embeddings via nomic-embed-text on port 11434 (CPU only, no VRAM competition)
+- **Ollama** embeddings via nomic-embed-text:v1.5 on port 11434 (CPU only, no VRAM competition)
 - **Python ingestion service** with watchdog file monitor (`cd ~/chuckai && .venv/bin/python -m ingest.watcher`)
 - **Hybrid BM25 + semantic search** with RRF fusion via Qdrant
 - **EPUB support** via ebooklib + BeautifulSoup4 (per-chapter extraction)
@@ -106,7 +107,6 @@ The following is fully working and validated:
 ### Further Improvements — NEXT
 
 - **Skip processed files** — add a manifest or Qdrant ID check to avoid re-embedding on watcher restart
-- **Relevance threshold** — filter low-scoring chunks to avoid injecting irrelevant context
 - **Corpus scaling** — test with larger document collections to validate on-disk HNSW performance
 
 ### Performance Tuning — COMPLETE ✓ (2026-04-01)
@@ -121,6 +121,18 @@ Debug session traced full request latency through the stack (Open WebUI → Pipe
 - **Ollama can become unresponsive** — observed Ollama embed hanging indefinitely (30s timeout) after llama-server restarts. Fixed by restarting Ollama (`sudo systemctl restart ollama`). Root cause unclear; may be related to resource contention during llama-server startup.
 - **Pipelines filter can disconnect** — after restarting llama-server, Open WebUI may stop routing through the Pipelines filter. Fix: `docker compose restart pipelines open-webui`.
 
+### RAG Retrieval Tuning — COMPLETE ✓ (2026-04-01)
+
+Live debugging session revealed several RAG retrieval issues causing irrelevant context injection and request failures:
+
+- **RRF scores are rank-based, not relevance-based** — Reciprocal Rank Fusion always returns positional scores (0.500 for rank 1, 0.333 for rank 2, etc.) regardless of actual semantic similarity. Every query matched something above threshold. Fixed by using **dense cosine similarity** for threshold filtering (via Qdrant `score_threshold`) and RRF only for re-ranking results that pass.
+- **Relevance threshold** — set to 0.50 cosine similarity. Unrelated queries (sports, general knowledge) score below this against technical documents and return 0 chunks. Related queries score 0.53–0.71 and retrieve correctly.
+- **Single slot request cancellation** — Open WebUI sends title generation requests alongside chat prompts. With `-np 1`, the title request cancelled the active chat generation mid-stream, producing empty responses. Fixed by setting `-np 2` in `start-llama-qwen.sh`.
+- **Conversation history contamination** — Open WebUI packs conversation history into a single user message. A 2000-char message containing prior assistant responses about microservices would match microservices chunks regardless of the actual question. Fixed by extracting only the last line when query exceeds 500 chars.
+- **Title generation polluting RAG** — Open WebUI's `### Task:` title/tag generation prompts were being embedded and searched unnecessarily. Fixed by skipping these in the pipeline inlet.
+- **Response mode tags** — pipeline outlet now appends `RAG`, `LLM`, or `Web` tag to every response footer, with RAG sources listed when context was used. Model instructed to silently ignore irrelevant context rather than explaining what the excerpts contain.
+- **Pipeline restart ordering is critical** — restarting pipelines alone breaks the filter connection. Must always restart pipelines first, wait for health, then restart open-webui. The `scripts/startup.sh` script handles this automatically.
+
 ### Phase 3 — PLANNED
 
 - Pandoc + LibreOffice for DOCX/PPTX/PDF output generation
@@ -134,7 +146,7 @@ Debug session traced full request latency through the stack (Open WebUI → Pipe
 | 8080 | llama-server (OpenAI API + health) | Active |
 | 3000 | Open WebUI | Active |
 | 8081 | SearXNG | Active |
-| 11434 | Ollama (nomic-embed-text, CPU) | Active |
+| 11434 | Ollama (nomic-embed-text:v1.5, CPU) | Active |
 | 6333 | Qdrant REST | Active |
 | 6334 | Qdrant gRPC | Active |
 | 9998 | Apache Tika | Active |
@@ -187,12 +199,14 @@ The order matters — llama.cpp first, then Pipelines. Each URL gets a correspon
 ### 2a. Pipelines must be registered as an OpenAI API connection
 Open WebUI v0.8.12 discovers Pipelines through its OpenAI API connections list, NOT through a separate `PIPELINES_URLS` env var. The `PIPELINES_URLS` and `PIPELINES_API_KEY` env vars do NOT work — Open WebUI can reach the server but the UI shows "Pipelines Not Detected." The fix is to add the Pipelines server URL (`http://localhost:9099`) as a second entry in `OPENAI_API_BASE_URLS` with the default Pipelines API key (`0p3n-w3bu!`) in `OPENAI_API_KEYS`.
 
-### 3. llama.cpp requires --jinja, -rea off, --poll 0, and --no-cache-prompt for Qwen 3.5
+### 3. llama.cpp requires --jinja, -rea off, --poll 0, --no-cache-prompt, and -np 2 for Qwen 3.5
 Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break Open WebUI's JSON stream parser. The `-rea off` flag disables thinking mode. It only works when `--jinja` is also present. `--reasoning-format none` alone does NOT work — we verified this across multiple llama.cpp builds.
 
 The `--poll 0` flag prevents llama-server from busy-waiting on a CPU core at 100% while idle. Without it, the main thread spins constantly polling for requests. This has no impact on generation performance.
 
 The `--no-cache-prompt` flag disables prompt caching. Qwen 3.5 uses a hybrid attention + Mamba/SSM architecture, and llama-server **cannot reuse cached KV state** for hybrid models — every request triggers `forcing full prompt re-processing due to lack of cache data`. Without this flag, llama-server still writes cache entries (growing to 1+ GB in RAM) and the save operation between requests escalates from 40ms to 38–160 seconds as the cache grows, blocking subsequent requests. With `--no-cache-prompt`, cache updates stay under 100ms. If you switch to a pure-transformer model (e.g. Llama, Mistral), re-enable prompt caching.
+
+The `-np 2` flag allocates two parallel request slots. Open WebUI sends title generation requests alongside chat prompts. With `-np 1`, the title request cancels the active chat generation mid-stream, producing empty responses. With `-np 2`, both can run concurrently.
 
 ### 4. SearXNG must use port mapping, not network_mode: host
 SearXNG always binds internally to port 8080 regardless of settings.yml. Use `ports: "8081:8080"` in docker-compose. Do not use `network_mode: host` for SearXNG — it will collide with llama-server on 8080.
@@ -227,16 +241,35 @@ The Open WebUI Pipelines Docker image (`ghcr.io/open-webui/pipelines:main`) requ
 
 ### Start everything (after reboot)
 ```bash
-# 1. Start llama.cpp
-bash ~/start-llama-qwen.sh &
-sleep 15 && curl -s http://localhost:8080/health
-
-# 2. Start Docker services
-cd ~ && docker compose up -d
-
-# 3. Warm up cold services (Ollama embeddings, Qdrant indexes, llama-server)
-sleep 10 && bash ~/chuckai/scripts/warmup.sh
+bash ~/chuckai/scripts/startup.sh
 ```
+
+The startup script (`scripts/startup.sh`) sequences all services in dependency order with health checks between each stage. It can also be used to do a full clean restart of a running stack — it kills all existing services before starting.
+
+**Startup sequence:**
+
+1. Kill existing llama-server, `docker compose down`, restart Ollama → wait for Ollama health
+2. Start llama-server → wait for health
+3. Start infrastructure (Qdrant, Tika, SearXNG) → wait for each
+4. Start Pipelines (needs Ollama + Qdrant) → wait for health
+5. Start Open WebUI (needs Pipelines for filter discovery) → wait for health
+6. Warmup all caches (Ollama embed, Qdrant HNSW indexes, llama-server)
+
+**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, the filter is never registered and RAG silently stops working. The only fix is restarting both containers. The startup script prevents this by ensuring Pipelines is healthy before Open WebUI starts.
+
+**Health check endpoints:**
+
+| Service | Health URL | What it proves |
+|---|---|---|
+| Ollama | `http://localhost:11434/api/version` | API is accepting requests |
+| llama-server | `http://localhost:8080/health` | Model is loaded and ready |
+| Qdrant | `http://localhost:6333/healthz` | Vector DB is ready |
+| Tika | `http://localhost:9998/tika` | Parser is accepting requests |
+| SearXNG | `http://localhost:8081` | Web server is up |
+| Pipelines | `http://localhost:9099/models` + auth header | API is up and authenticating |
+| Open WebUI | `http://localhost:3000` | Frontend is serving |
+
+**Note:** The Pipelines `/models` endpoint requires the API key (`Authorization: Bearer 0p3n-w3bu!`). Without it, the endpoint returns 403 even when the service is healthy.
 
 ### Switch models
 ```bash
@@ -332,7 +365,7 @@ When implementing Phase 2, follow these design decisions:
 
 **Vector DB:** Qdrant with on-disk HNSW — required for 2-3TB corpus (~75-150M vectors). Configure `hnsw_index.on_disk: true` and `storage.on_disk_payload: true` from day one. Do not attempt in-memory indexing at this scale.
 
-**Embeddings:** Ollama running `nomic-embed-text` on CPU (port 11434). This runs independently of Qwen on the GPU — no VRAM competition. 768-dim vectors, ~80ms per chunk on the i7.
+**Embeddings:** Ollama running `nomic-embed-text:v1.5` on CPU (port 11434). This runs independently of Qwen on the GPU — no VRAM competition. 768-dim vectors, ~80ms per chunk on the i7.
 
 **Search strategy:** Hybrid BM25 sparse + semantic dense with Reciprocal Rank Fusion (RRF). Pure semantic search misses exact-match queries on technical documents. Both vector types stored in the same Qdrant collection.
 
@@ -377,3 +410,8 @@ All ingestion code, SFTP config, and file watchers reference `~/documents/` and 
 | Only 100GB disk visible | LVM not extended | sudo lvextend -l +100%FREE then resize2fs |
 | "Pipelines Not Detected" in UI | PIPELINES_URLS env var used | Add pipelines URL to OPENAI_API_BASE_URLS instead (see rule 2a) |
 | Pipelines returns 401 | Missing API key | Use `0p3n-w3bu!` in OPENAI_API_KEYS (see rule 10) |
+| Chat prompt returns empty/hangs | Title generation cancels chat (single slot) | Use `-np 2` in start-llama-qwen.sh |
+| RAG injects irrelevant context | RRF rank scores don't reflect relevance | Use dense cosine similarity for threshold filtering (score_threshold in Qdrant query) |
+| RAG matches wrong content on follow-up | Conversation history embedded as query | Pipeline extracts last line only when query > 500 chars |
+| Pipelines health check returns 403 | `/models` endpoint requires auth | Include `Authorization: Bearer 0p3n-w3bu!` header |
+| Services fail after reboot | Wrong startup order | Run `bash ~/chuckai/scripts/startup.sh` (sequenced with health checks) |

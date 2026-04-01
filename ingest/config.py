@@ -9,7 +9,7 @@ COLLECTION_COLD = "docs_cold"
 
 # Ollama embeddings
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL = "nomic-embed-text:v1.5"
 EMBED_DIM = 768
 
 # Tika

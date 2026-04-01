@@ -44,7 +44,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 │  port 6333  │  │   port 9998     │  │  port 11434    │
 │             │  │                 │  │                │
 │ Vector DB   │  │ Document parse  │  │ nomic-embed    │
-│ On-disk HNSW│  │ PDF DOCX EPUB   │  │ text (CPU)     │
+│ On-disk HNSW│  │ PDF DOCX EPUB   │  │ text v1.5 CPU  │
 │ 75-150M vec │  │ email HTML etc  │  │ 768-dim embed  │
 └─────────────┘  └─────────────────┘  └────────────────┘
 ```
@@ -72,7 +72,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 | Chat UI | Open WebUI | v0.8.12 | Full-featured chat interface |
 | Web Search | SearXNG | 2026.3.18 | Self-hosted web search augmentation |
 | Containers | Docker CE | 29.3.0 | Hosts WebUI and SearXNG |
-| Embeddings | Ollama + nomic-embed-text | 0.18.2 | RAG embeddings on CPU |
+| Embeddings | Ollama + nomic-embed-text:v1.5 | 0.18.2 | RAG embeddings on CPU |
 | Vector DB | Qdrant | latest | On-disk HNSW vector search |
 | Doc Parser | Apache Tika | latest-full | Universal document extraction |
 | RAG Pipeline | Open WebUI Pipelines | main | Hybrid retrieval filter with RRF fusion |
@@ -152,8 +152,12 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Inline source citations and chapter references in model responses, with a Sources footer listing all retrieved documents
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
 - Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
-- Post-boot warmup script to prime Ollama embeddings, Qdrant indexes, and llama-server KV cache
-- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin
+- Sequenced startup script (`scripts/startup.sh`) with dependency ordering and health checks — ensures Pipelines is ready before Open WebUI starts
+- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin; `-np 2` prevents title generation from cancelling chat requests
+- Relevance filtering via dense cosine similarity scoring (not RRF rank scores) with 0.50 threshold — unrelated queries return zero chunks
+- Response mode tags (`RAG`, `LLM`, `Web`) in every response footer for retrieval transparency
+- Query isolation — only the user's latest message is embedded for RAG, preventing conversation history from contaminating retrieval
+- Open WebUI internal tasks (title/tag generation) skip RAG pipeline entirely
 
 ### Phase 3 — Planned
 
@@ -213,29 +217,36 @@ huggingface-cli download bartowski/Qwen_Qwen3.5-9B-Instruct-GGUF \
 ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 ```
 
-### 5. Start llama-server
+### 5. Start the full stack
 
 ```bash
-bash ~/start-llama-qwen.sh &
-sleep 15 && curl -s http://localhost:8080/health
-# Expected: {"status":"ok"}
+bash ~/chuckai/scripts/startup.sh
 ```
 
-### 6. Start Docker services
+The startup script sequences all services in dependency order with health checks between each stage. It also works as a clean restart — it kills all existing services before starting.
 
-```bash
-cd ~ && docker compose up -d
-sleep 10 && curl -s http://localhost:3000/api/version
-# Expected: {"version":"0.8.12"}
-```
+**Startup sequence:**
 
-### 6a. Warm up services (optional but recommended)
+1. Kill existing llama-server, `docker compose down`, restart Ollama
+2. Start llama-server → wait for model load
+3. Start infrastructure (Qdrant, Tika, SearXNG) → wait for each
+4. Start Pipelines (needs Ollama + Qdrant) → wait for health
+5. Start Open WebUI (needs Pipelines for filter discovery) → wait for health
+6. Warmup all caches (Ollama embed, Qdrant HNSW indexes, llama-server)
 
-```bash
-bash ~/chuckai/scripts/warmup.sh
-```
+**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, RAG silently stops working. The startup script prevents this.
 
-Primes Ollama embedding model, Qdrant HNSW indexes, and llama-server KV cache. Eliminates cold-start latency on the first query after reboot.
+**Health check endpoints:**
+
+| Service | Health URL | What it proves |
+|---|---|---|
+| Ollama | `/api/version` | API is accepting requests |
+| llama-server | `/health` | Model is loaded and ready |
+| Qdrant | `/healthz` | Vector DB is ready |
+| Tika | `/tika` | Parser is accepting requests |
+| SearXNG | `localhost:8081` | Web server is up |
+| Pipelines | `/models` + auth header | API is up and authenticating |
+| Open WebUI | `localhost:3000` | Frontend is serving |
 
 ### 7. Configure web search
 
@@ -255,7 +266,7 @@ mkdir -p ~/documents/inbox ~/documents/inbox_priority
 
 # Start Ollama and pull the embedding model
 sudo systemctl enable ollama && sudo systemctl start ollama
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text:v1.5
 
 # Create Python venv and install dependencies
 cd ~/chuckai
@@ -355,15 +366,25 @@ Apply changes:
 source ~/.bashrc
 ```
 
+### Full stack start / restart
+
+```bash
+bash ~/chuckai/scripts/startup.sh
+```
+
+Kills everything, then starts services in dependency order with health checks. Safe to run on a fresh boot or against a running stack.
+
 ### Docker services
 
 ```bash
-docker compose up -d        # start all services
+docker compose up -d        # start all services (no dependency ordering)
 docker compose down         # stop all services
 docker compose restart      # restart all services
 docker compose ps           # check status
 docker compose logs -f      # watch logs
 ```
+
+**Note:** `docker compose up -d` starts all containers simultaneously. Use `scripts/startup.sh` instead to ensure correct startup order (Pipelines before Open WebUI).
 
 ### Open WebUI backup and rollback
 
@@ -455,9 +476,11 @@ Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vecto
 ### Performance Tuning ✓
 Full-stack latency profiling (Open WebUI → Pipelines → Ollama/Qdrant → llama-server) identified prompt caching as the primary bottleneck. Qwen 3.5's hybrid Mamba/attention architecture forces llama-server to reprocess every prompt from scratch — the cache was being written and immediately invalidated, with save times escalating to 160 seconds per request. Disabled with `--no-cache-prompt`. Additional fixes: `--poll 0` for idle CPU spin, warmup script for cold-start latency, and improved error logging in the RAG pipeline.
 
+### RAG Retrieval Tuning ✓
+Live debugging revealed that RRF fusion scores are rank-based (always 0.500, 0.333, etc.), not relevance-based — making threshold filtering useless. Switched to dense cosine similarity for filtering with a 0.50 threshold. Fixed conversation history contamination (Open WebUI packs history into a single message), title generation cancelling active chat requests (`-np 1` → `-np 2`), and added response mode tags (`RAG`, `LLM`, `Web`) for retrieval transparency. Created sequenced startup script (`scripts/startup.sh`) to ensure correct service dependency ordering with health checks.
+
 ### Next — Further Improvements
 - **Skip already-processed files** in the watcher to avoid redundant re-embedding on restart
-- **Relevance threshold** — filter out low-scoring chunks to avoid injecting irrelevant context
 - **Corpus scaling** — test with larger document collections to validate on-disk HNSW performance
 
 ### Phase 3 — Document Output
