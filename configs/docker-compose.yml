@@ -6,8 +6,8 @@ services:
     volumes:
       - chuck_open-webui:/app/backend/data
     environment:
-      - OPENAI_API_BASE_URL=http://localhost:8080/v1
-      - OPENAI_API_KEY=dummy
+      - OPENAI_API_BASE_URLS=http://localhost:8080/v1;http://localhost:9099
+      - OPENAI_API_KEYS=dummy;0p3n-w3bu!
       - PORT=3000
     restart: unless-stopped
 
@@ -23,6 +23,36 @@ services:
       - BASE_URL=http://localhost:8081/
       - INSTANCE_NAME=chuckai-search
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
+    restart: unless-stopped
+
+  tika:
+    image: apache/tika:latest-full
+    container_name: tika
+    ports:
+      - "9998:9998"
+    restart: unless-stopped
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    container_name: pipelines
+    network_mode: host
+    volumes:
+      - ../pipelines:/app/pipelines
+    environment:
+      - PORT=9099
+    restart: unless-stopped
+
 volumes:
   chuck_open-webui:
     external: true
+  qdrant_data:

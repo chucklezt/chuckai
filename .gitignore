@@ -8,6 +8,10 @@
 __pycache__/
 *.pyc
 *.egg-info/
+.venv/
+
+# Pipelines auto-generated runtime directories
+pipelines/*/
 
 # Environment secrets — never commit
 .env

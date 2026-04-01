@@ -36,7 +36,8 @@ The stack is intentionally positioned as the on-premises counterpart to the GCP-
 | SearXNG | 2026.3.18-3810dc9d1 |
 | Docker CE | 29.3.0 |
 | Docker Compose | v5.1.0 |
-| Ollama | 0.18.2 (installed, NOT running — reserved for RAG) |
+| Ollama | 0.18.2 (running — nomic-embed-text for RAG embeddings) |
+| Open WebUI Pipelines | main (ghcr.io/open-webui/pipelines:main) |
 | ROCm SMI | 3.0.0+55c0f58 |
 | Python | 3.10.12 |
 | Ubuntu | 22.04.5 LTS |
@@ -51,20 +52,21 @@ chuckai/
 ├── README.md                   # Public-facing project documentation
 ├── .gitignore                  # Excludes models, logs, vector DB data
 ├── configs/                    # All service configuration files
-│   ├── docker-compose.yml      # Open WebUI (latest/v0.8.12) + SearXNG — the working compose file
+│   ├── docker-compose.yml      # Open WebUI + SearXNG + Qdrant + Tika + Pipelines
 │   ├── start-llama-qwe359.sh   # llama-server startup — Qwen 3.5 9B Q4
 │   ├── start-llama-27b.sh      # llama-server startup — Qwen 3.5 27B Q3 (custom quant)
 │   └── searxng-settings.yml    # SearXNG configuration
-├── ingest/                     # Phase 2 — RAG ingestion service (in development)
+├── ingest/                     # RAG ingestion service
+│   ├── __init__.py
 │   ├── requirements.txt
-│   ├── watcher.py              # inotify watchdog for /mnt/documents/
+│   ├── config.py               # Central configuration constants
+│   ├── watcher.py              # Watchdog file monitor for ~/documents/
 │   ├── extractor.py            # Apache Tika wrapper + EPUB handler
-│   ├── chunker.py              # RecursiveCharacterTextSplitter
+│   ├── chunker.py              # Recursive character text splitter
 │   ├── bm25_vectorizer.py      # Sparse BM25 token weights
 │   └── embedder.py             # Dense + sparse upsert to Qdrant
 ├── pipelines/                  # Open WebUI pipeline plugins
-│   ├── rag_pipeline.py         # Hybrid BM25 + semantic RAG retrieval
-│   └── doc_output_pipeline.py  # DOCX/PPTX/PDF output generation
+│   └── rag_pipeline.py         # Hybrid BM25 + semantic RAG retrieval filter
 ├── scripts/                    # Utility and maintenance scripts
 │   └── healthcheck.sh          # Full stack health check
 └── docs/                       # Architecture and reference documentation
@@ -84,19 +86,20 @@ The following is fully working and validated:
 - **Web search** configured via Admin Panel UI (not env vars)
 - **Model switching** between 9B and 27B via separate startup scripts
 
-### Phase 2 — IN DEVELOPMENT
+### Phase 2 — COMPLETE ✓
 
-- Qdrant vector database (port 6333)
-- Apache Tika document parsing (port 9998)
-- Ollama embeddings via nomic-embed-text (port 11434, CPU only)
-- Python ingestion service with file watcher
-- Hybrid BM25 + semantic search with RRF fusion
-- EPUB support via ebooklib + BeautifulSoup4
-- Tiered collections: docs_hot + docs_cold
+- **Qdrant** vector database on port 6333 — on-disk HNSW, on-disk payload
+- **Apache Tika** document parsing on port 9998
+- **Ollama** embeddings via nomic-embed-text on port 11434 (CPU only, no VRAM competition)
+- **Python ingestion service** with watchdog file monitor (`cd ~/chuckai && .venv/bin/python -m ingest.watcher`)
+- **Hybrid BM25 + semantic search** with RRF fusion via Qdrant
+- **EPUB support** via ebooklib + BeautifulSoup4 (per-chapter extraction)
+- **Tiered collections:** docs_hot (priority) + docs_cold (archive)
+- **Document storage** at `~/documents/inbox/` and `~/documents/inbox_priority/` — symlink-ready for future SATA migration
+- **RAG pipeline** integrated into Open WebUI via Pipelines filter on port 9099
 
 ### Phase 3 — PLANNED
 
-- Open WebUI Pipelines (port 9099)
 - Pandoc + LibreOffice for DOCX/PPTX/PDF output generation
 
 ---
@@ -108,11 +111,11 @@ The following is fully working and validated:
 | 8080 | llama-server (OpenAI API + health) | Active |
 | 3000 | Open WebUI | Active |
 | 8081 | SearXNG | Active |
-| 11434 | Ollama (embeddings only) | Installed, not running |
-| 6333 | Qdrant REST | Phase 2 |
-| 6334 | Qdrant gRPC | Phase 2 |
-| 9998 | Apache Tika | Phase 2 |
-| 9099 | Open WebUI Pipelines | Phase 3 |
+| 11434 | Ollama (nomic-embed-text, CPU) | Active |
+| 6333 | Qdrant REST | Active |
+| 6334 | Qdrant gRPC | Active |
+| 9998 | Apache Tika | Active |
+| 9099 | Open WebUI Pipelines (RAG filter) | Active |
 
 ---
 
@@ -148,8 +151,18 @@ docker compose up -d
 
 **Note:** The earlier v0.5.20 pinning was due to streaming bugs in 0.6.x with llama.cpp. v0.8.12 resolved these issues. If a future `:latest` pull introduces regressions, pin to `v0.8.12` using the backup image or the registry tag.
 
-### 2. Always use OPENAI_API_BASE_URL, never OLLAMA_BASE_URL
+### 2. Always use OPENAI_API_BASE_URLS (plural), never OLLAMA_BASE_URL
 Open WebUI connects to llama.cpp via the OpenAI-compatible `/v1` endpoint. Using `OLLAMA_BASE_URL` causes Open WebUI to operate in Ollama mode which appends `:latest` to every model name, causing "model not found" errors.
+
+With Pipelines enabled, the env vars use the plural form with semicolon-separated lists:
+```yaml
+- OPENAI_API_BASE_URLS=http://localhost:8080/v1;http://localhost:9099
+- OPENAI_API_KEYS=dummy;0p3n-w3bu!
+```
+The order matters — llama.cpp first, then Pipelines. Each URL gets a corresponding API key.
+
+### 2a. Pipelines must be registered as an OpenAI API connection
+Open WebUI v0.8.12 discovers Pipelines through its OpenAI API connections list, NOT through a separate `PIPELINES_URLS` env var. The `PIPELINES_URLS` and `PIPELINES_API_KEY` env vars do NOT work — Open WebUI can reach the server but the UI shows "Pipelines Not Detected." The fix is to add the Pipelines server URL (`http://localhost:9099`) as a second entry in `OPENAI_API_BASE_URLS` with the default Pipelines API key (`0p3n-w3bu!`) in `OPENAI_API_KEYS`.
 
 ### 3. llama.cpp requires --jinja and -rea off for Qwen 3.5
 Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break Open WebUI's JSON stream parser. The `-rea off` flag disables thinking mode. It only works when `--jinja` is also present. `--reasoning-format none` alone does NOT work — we verified this across multiple llama.cpp builds.
@@ -177,6 +190,9 @@ The `.gitignore` excludes `*.gguf` files. Models live at `~/models/` and are nev
 
 ### 9. HSA_OVERRIDE_GFX_VERSION=10.3.0 is always required
 This environment variable must be set before every llama-server launch. Without it, ROCm may not correctly identify the RX 6800 XT (gfx1030) and falls back to CPU inference silently.
+
+### 10. Pipelines server default API key is 0p3n-w3bu!
+The Open WebUI Pipelines Docker image (`ghcr.io/open-webui/pipelines:main`) requires authentication on all endpoints. The default API key is `0p3n-w3bu!`. This key must be included in `OPENAI_API_KEYS` in docker-compose (see rule 2a).
 
 ---
 
@@ -292,7 +308,15 @@ When implementing Phase 2, follow these design decisions:
 
 **EPUB handling:** Route `.epub` files through `ebooklib` + `BeautifulSoup4`, NOT Tika. Tika flattens EPUBs into a single blob. ebooklib extracts per-chapter with title/author/chapter metadata. Install: `pip install ebooklib==0.18 beautifulsoup4==4.12.3`
 
-**Document ingestion:** SFTP from Mac via Finder (`sftp://chuck@192.168.1.59`) or Cyberduck. Drop files to `/mnt/documents/inbox_priority/` (hot tier) or `/mnt/documents/inbox/` (cold tier).
+**Document storage:** Documents live at `~/documents/` on the NVMe, with a symlink-based migration path. When a dedicated SATA drive is added later, move the data and repoint the symlink (same pattern as `qwen-active.gguf`):
+```bash
+# Future migration to SATA
+mv ~/documents/* /mnt/sata/documents/
+ln -sf /mnt/sata/documents ~/documents
+```
+All ingestion code, SFTP config, and file watchers reference `~/documents/` and never need to change.
+
+**Document ingestion:** SFTP from Mac via Finder (`sftp://chuck@192.168.1.59`) or Cyberduck. Drop files to `~/documents/inbox_priority/` (hot tier) or `~/documents/inbox/` (cold tier).
 
 **Abstraction principle:** Implement embeddings, vector store, and LLM calls behind simple interfaces from the start. This makes porting to GCP (Vertex AI embeddings, Vertex AI Vector Search, Gemini) a module swap rather than a rewrite.
 
@@ -312,3 +336,5 @@ When implementing Phase 2, follow these design decisions:
 | llama.cpp falls back to CPU | Wrong cmake flag | Use -DGGML_HIP=ON not -DGGML_ROCM=ON |
 | Static IP reverts on reboot | cloud-init overwriting netplan | Add network: {config: disabled} to cloud-init config |
 | Only 100GB disk visible | LVM not extended | sudo lvextend -l +100%FREE then resize2fs |
+| "Pipelines Not Detected" in UI | PIPELINES_URLS env var used | Add pipelines URL to OPENAI_API_BASE_URLS instead (see rule 2a) |
+| Pipelines returns 401 | Missing API key | Use `0p3n-w3bu!` in OPENAI_API_KEYS (see rule 10) |

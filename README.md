@@ -30,14 +30,15 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 ┌─────────────┐  ┌─────────────────┐  ┌────────────────┐
 │ llama-server│  │    SearXNG      │  │  Pipelines     │
 │  port 8080  │  │   port 8081     │  │  port 9099     │
-│             │  │                 │  │  (Phase 3)     │
-│ qwen-active │  │ Web-augmented   │  │                │
-│ (symlink)   │  │ search          │  │                │
-│ AMD RX 6800 │  │                 │  │                │
+│             │  │                 │  │                │
+│ qwen-active │  │ Web-augmented   │  │ RAG filter     │
+│ (symlink)   │  │ search          │  │ Hybrid search  │
+│ AMD RX 6800 │  │                 │  │ + RRF fusion   │
 │ XT (ROCm)   │  │                 │  │                │
-└─────────────┘  └─────────────────┘  └────────────────┘
-       │
-       ▼  (Phase 2 — RAG Stack)
+└─────────────┘  └─────────────────┘  └───────┬────────┘
+                                              │
+       ┌──────────────────────────────────────┘
+       ▼  (RAG Stack)
 ┌─────────────┐  ┌─────────────────┐  ┌────────────────┐
 │   Qdrant    │  │  Apache Tika    │  │    Ollama      │
 │  port 6333  │  │   port 9998     │  │  port 11434    │
@@ -71,9 +72,10 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 | Chat UI | Open WebUI | v0.8.12 | Full-featured chat interface |
 | Web Search | SearXNG | 2026.3.18 | Self-hosted web search augmentation |
 | Containers | Docker CE | 29.3.0 | Hosts WebUI and SearXNG |
-| Embeddings | Ollama + nomic-embed-text | 0.18.2 | RAG embeddings on CPU (Phase 2) |
-| Vector DB | Qdrant | latest | On-disk HNSW vector search (Phase 2) |
-| Doc Parser | Apache Tika | latest-full | Universal document extraction (Phase 2) |
+| Embeddings | Ollama + nomic-embed-text | 0.18.2 | RAG embeddings on CPU |
+| Vector DB | Qdrant | latest | On-disk HNSW vector search |
+| Doc Parser | Apache Tika | latest-full | Universal document extraction |
+| RAG Pipeline | Open WebUI Pipelines | main | Hybrid retrieval filter with RRF fusion |
 
 ---
 
@@ -137,20 +139,21 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Dual-model setup — switch between 9B (fast) and 27B (capable) via symlink
 - Accessible from any device on the local network
 
-### Phase 2 — In Development
+### Phase 2 — Complete
 
 - Hybrid BM25 + semantic vector search with Reciprocal Rank Fusion
-- 2–3TB document corpus support with tiered on-disk HNSW indexing
+- 2–3TB document corpus support with tiered on-disk HNSW indexing (docs_hot + docs_cold)
 - Universal document parsing: PDF, DOCX, PPTX, XLSX, EPUB, email, HTML
-- EPUB chapter-aware extraction with per-chapter metadata
-- Incremental ingestion — drop files via SFTP from Mac, indexed automatically
-- Metadata-filtered retrieval by author, title, chapter, document type
+- EPUB chapter-aware extraction with per-chapter metadata via ebooklib
+- Incremental ingestion — drop files via SFTP from Mac, indexed automatically via file watcher
+- Symlink-based document storage (`~/documents/`) — starts on NVMe, migrates to dedicated SATA drive with a single `ln -sf`
+- RAG retrieval integrated into Open WebUI via Pipelines filter — every chat query searches the knowledge base
+- Pipelines server registered as an OpenAI API connection (not a separate Pipelines URL)
 
 ### Phase 3 — Planned
 
 - On-demand document generation: ask for a DOCX or PPTX, get a file
 - Pandoc + LibreOffice conversion pipeline
-- Open WebUI Pipelines middleware
 
 ---
 
@@ -387,18 +390,18 @@ grep "offload" ~/llama.log | head -5                  # confirm GPU layers at st
 | 8080 | llama-server — OpenAI API | Active |
 | 3000 | Open WebUI | Active |
 | 8081 | SearXNG | Active |
-| 11434 | Ollama (embeddings, CPU) | Phase 2 |
-| 6333 | Qdrant REST | Phase 2 |
-| 6334 | Qdrant gRPC | Phase 2 |
-| 9998 | Apache Tika | Phase 2 |
-| 9099 | Open WebUI Pipelines | Phase 3 |
+| 11434 | Ollama (embeddings, CPU) | Active |
+| 6333 | Qdrant REST | Active |
+| 6334 | Qdrant gRPC | Active |
+| 9998 | Apache Tika | Active |
+| 9099 | Open WebUI Pipelines (RAG filter) | Active |
 
 ---
 
 ## Roadmap
 
-### Phase 2 — RAG Stack
-Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading — start with a small corpus and grow without re-indexing.
+### Phase 2 — RAG Stack ✓
+Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading via file watcher — drop files into `~/documents/inbox/` or `~/documents/inbox_priority/` and they're indexed automatically. RAG retrieval wired into Open WebUI via a Pipelines filter that intercepts every chat query.
 
 ### Phase 3 — Document Output
 On-demand generation of Word documents, PowerPoint presentations, and PDFs from model output. Pandoc + LibreOffice conversion triggered by natural language requests in chat.
