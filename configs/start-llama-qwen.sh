@@ -11,6 +11,7 @@ cd /home/chuck/llama.cpp
   --cache-type-v q4_0 \
   -fa on \
   -np 2 \
+  --ctx-checkpoints 0 \
   --temp 0.6 \
   --top-p 0.95 \
   --top-k 20 \

@@ -92,7 +92,7 @@ The following is fully working and validated:
 
 - **Qdrant** vector database on port 6333 — on-disk HNSW, on-disk payload
 - **Apache Tika** document parsing on port 9998
-- **Ollama** embeddings via nomic-embed-text:v1.5 on port 11434 (CPU only, no VRAM competition)
+- **Ollama** embeddings via nomic-embed-text:v1.5 on port 11434 (CPU only via systemd override, no VRAM competition)
 - **Python ingestion service** with watchdog file monitor (`cd ~/chuckai && .venv/bin/python -m ingest.watcher`)
 - **Hybrid BM25 + semantic search** with RRF fusion via Qdrant
 - **EPUB support** via ebooklib + BeautifulSoup4 (per-chapter extraction)
@@ -199,7 +199,7 @@ The order matters — llama.cpp first, then Pipelines. Each URL gets a correspon
 ### 2a. Pipelines must be registered as an OpenAI API connection
 Open WebUI v0.8.12 discovers Pipelines through its OpenAI API connections list, NOT through a separate `PIPELINES_URLS` env var. The `PIPELINES_URLS` and `PIPELINES_API_KEY` env vars do NOT work — Open WebUI can reach the server but the UI shows "Pipelines Not Detected." The fix is to add the Pipelines server URL (`http://localhost:9099`) as a second entry in `OPENAI_API_BASE_URLS` with the default Pipelines API key (`0p3n-w3bu!`) in `OPENAI_API_KEYS`.
 
-### 3. llama.cpp requires --jinja, -rea off, --poll 0, --no-cache-prompt, and -np 2 for Qwen 3.5
+### 3. llama.cpp requires --jinja, -rea off, --poll 0, --no-cache-prompt, -np 2, and --ctx-checkpoints 0 for Qwen 3.5
 Qwen 3.5 outputs `<think>...</think>` reasoning blocks by default. These break Open WebUI's JSON stream parser. The `-rea off` flag disables thinking mode. It only works when `--jinja` is also present. `--reasoning-format none` alone does NOT work — we verified this across multiple llama.cpp builds.
 
 The `--poll 0` flag prevents llama-server from busy-waiting on a CPU core at 100% while idle. Without it, the main thread spins constantly polling for requests. This has no impact on generation performance.
@@ -207,6 +207,8 @@ The `--poll 0` flag prevents llama-server from busy-waiting on a CPU core at 100
 The `--no-cache-prompt` flag disables prompt caching. Qwen 3.5 uses a hybrid attention + Mamba/SSM architecture, and llama-server **cannot reuse cached KV state** for hybrid models — every request triggers `forcing full prompt re-processing due to lack of cache data`. Without this flag, llama-server still writes cache entries (growing to 1+ GB in RAM) and the save operation between requests escalates from 40ms to 38–160 seconds as the cache grows, blocking subsequent requests. With `--no-cache-prompt`, cache updates stay under 100ms. If you switch to a pure-transformer model (e.g. Llama, Mistral), re-enable prompt caching.
 
 The `-np 2` flag allocates two parallel request slots. Open WebUI sends title generation requests alongside chat prompts. With `-np 1`, the title request cancels the active chat generation mid-stream, producing empty responses. With `-np 2`, both can run concurrently.
+
+The `--ctx-checkpoints 0` flag disables context checkpoint saving between requests. With `-np 2`, llama-server creates 50-87MB checkpoint files after each completion, which can block subsequent requests. Disabling checkpoints eliminates this overhead.
 
 ### 4. SearXNG must use port mapping, not network_mode: host
 SearXNG always binds internally to port 8080 regardless of settings.yml. Use `ports: "8081:8080"` in docker-compose. Do not use `network_mode: host` for SearXNG — it will collide with llama-server on 8080.
@@ -371,7 +373,7 @@ When implementing Phase 2, follow these design decisions:
 
 **Vector DB:** Qdrant with on-disk HNSW — required for 2-3TB corpus (~75-150M vectors). Configure `hnsw_index.on_disk: true` and `storage.on_disk_payload: true` from day one. Do not attempt in-memory indexing at this scale.
 
-**Embeddings:** Ollama running `nomic-embed-text:v1.5` on CPU (port 11434). This runs independently of Qwen on the GPU — no VRAM competition. 768-dim vectors, ~80ms per chunk on the i7.
+**Embeddings:** Ollama running `nomic-embed-text:v1.5` on CPU (port 11434). Forced to CPU via systemd override (`HIP_VISIBLE_DEVICES=-1`, `ROCR_VISIBLE_DEVICES=-1` in `/etc/systemd/system/ollama.service.d/override.conf`). Without this override, Ollama loads the embedding model onto the GPU (260MB VRAM) and hangs when llama-server restarts due to ROCm resource contention. On CPU: ~19ms warm, ~400ms cold start. 768-dim vectors.
 
 **Search strategy:** Hybrid BM25 sparse + semantic dense with Reciprocal Rank Fusion (RRF). Pure semantic search misses exact-match queries on technical documents. Both vector types stored in the same Qdrant collection.
 
@@ -402,7 +404,7 @@ All ingestion code, SFTP config, and file watchers reference `~/documents/` and 
 | llama-server 100% CPU at idle | Busy-wait polling | Add `--poll 0` to startup script |
 | Multi-turn chat gets progressively slower | Prompt cache growing, saves take 40-160s | Add `--no-cache-prompt` (required for Qwen 3.5 hybrid arch) |
 | Slow first query after reboot | Cold Ollama/Qdrant caches | Run `bash ~/chuckai/scripts/warmup.sh` after startup |
-| Ollama embed hangs (30s timeout) | Ollama unresponsive after restarts | `sudo systemctl restart ollama` |
+| Ollama embed hangs (30s timeout) | Ollama on GPU, ROCm contention with llama-server | Force CPU: `HIP_VISIBLE_DEVICES=-1` in systemd override (see Phase 2 design ref) |
 | RAG not triggering after restart | Pipelines filter disconnected | `docker compose restart pipelines open-webui` |
 | "Expecting value: line 1 column 1" | Qwen think tags in stream | Confirm `-rea off` and `--jinja` in startup script |
 | "Model not found :latest" | OLLAMA_BASE_URL set | Use OPENAI_API_BASE_URL=http://localhost:8080/v1 |

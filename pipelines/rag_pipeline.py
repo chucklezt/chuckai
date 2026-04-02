@@ -28,7 +28,7 @@ class Pipeline:
         collection_cold: str = Field(default="docs_cold")
         top_k: int = Field(default=10)
         min_hot_results: int = Field(default=3)
-        score_threshold: float = Field(default=0.5)
+        score_threshold: float = Field(default=0.55)
         priority: int = Field(default=0)
         enabled: bool = Field(default=True)
 
@@ -71,12 +71,13 @@ class Pipeline:
         if query.lstrip().startswith("### Task:"):
             return body
 
-        # Detect web search — Open WebUI injects search results into messages
-        self._web_search = any(
-            "search results" in str(m.get("content", "")).lower()
-            or "web_search" in str(m.get("metadata", {}))
-            for m in messages
-        )
+        # Detect web search from body features
+        self._web_search = bool(body.get("features", {}).get("web_search"))
+
+        # Skip RAG when web search is active — web results are sufficient context
+        if self._web_search:
+            self._last_sources = []
+            return body
 
         # Only use the last user turn for RAG — Open WebUI may pack conversation
         # history into a single message, causing irrelevant matches against
@@ -145,16 +146,16 @@ class Pipeline:
         return body
 
     async def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
-        messages = body.get("messages", [])
-        if not messages:
-            self._last_sources = []
-            self._web_search = False
-            return body
+        try:
+            messages = body.get("messages", [])
+            if not messages:
+                return body
 
-        # Find the last assistant message
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                # Determine response mode and build footer
+            # Find the last assistant message
+            for msg in reversed(messages):
+                if msg.get("role") != "assistant" or not msg.get("content"):
+                    continue
+
                 has_rag = bool(self._last_sources)
                 has_web = self._web_search
 
@@ -163,16 +164,11 @@ class Pipeline:
                 if has_rag:
                     content = msg["content"].lower()
                     skip_phrases = [
-                        "do not contain",
-                        "don't contain",
-                        "no information",
-                        "not relevant",
-                        "not related",
-                        "rely on my own",
-                        "own knowledge",
-                        "no relevant",
+                        "do not contain", "don't contain", "no information",
+                        "not relevant", "not related", "rely on my own",
+                        "own knowledge", "no relevant",
                     ]
-                    rag_used = not any(phrase in content for phrase in skip_phrases)
+                    rag_used = not any(p in content for p in skip_phrases)
 
                 # Build mode tag
                 modes = []
@@ -182,28 +178,25 @@ class Pipeline:
                     modes.append("Web")
                 if not modes:
                     modes.append("LLM")
-                mode_tag = " + ".join(modes)
 
-                # Build footer
-                footer = f"\n\n---\n`{mode_tag}`"
+                msg["content"] += f"\n\n---\n`{' + '.join(modes)}`"
 
                 # Append RAG sources if used
-                if rag_used:
-                    lines = ["\n**Sources:**"]
+                if rag_used and self._last_sources:
+                    lines = []
                     for source, book, chapter in self._last_sources:
-                        parts = [f"*{source}*"]
-                        if book:
-                            parts = [f"*{book}*"]
+                        parts = [f"*{book}*"] if book else [f"*{source}*"]
                         if chapter:
                             parts.append(chapter)
                         lines.append(f"- {' — '.join(parts)}")
-                    footer += "\n".join(lines)
+                    msg["content"] += "\n**Sources:**\n" + "\n".join(lines)
 
-                msg["content"] += footer
                 break
-
-        self._last_sources = []
-        self._web_search = False
+        except Exception as e:
+            log.error("outlet error: %s", e)
+        finally:
+            self._last_sources = []
+            self._web_search = False
         return body
 
     def _retrieve(self, query: str) -> list[dict]:
@@ -308,12 +301,12 @@ class Pipeline:
             return []
 
     def _embed(self, query: str) -> list[float]:
-        """Dense embedding via Ollama."""
+        """Dense embedding via Ollama. Fails fast with 5s timeout."""
         try:
             resp = requests.post(
                 f"{self.valves.ollama_url}/api/embed",
                 json={"model": self.valves.embed_model, "input": query},
-                timeout=30,
+                timeout=5,
             )
             resp.raise_for_status()
             return resp.json()["embeddings"][0]

@@ -72,7 +72,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 | Chat UI | Open WebUI | v0.8.12 | Full-featured chat interface |
 | Web Search | SearXNG | 2026.3.18 | Self-hosted web search augmentation |
 | Containers | Docker CE | 29.3.0 | Hosts WebUI and SearXNG |
-| Embeddings | Ollama + nomic-embed-text:v1.5 | 0.18.2 | RAG embeddings on CPU |
+| Embeddings | Ollama + nomic-embed-text:v1.5 | 0.18.2 | RAG embeddings on CPU (forced via systemd override) |
 | Vector DB | Qdrant | latest | On-disk HNSW vector search |
 | Doc Parser | Apache Tika | latest-full | Universal document extraction |
 | RAG Pipeline | Open WebUI Pipelines | main | Hybrid retrieval filter with RRF fusion |
@@ -153,7 +153,8 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
 - Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
 - Sequenced startup script (`scripts/startup.sh`) with dependency ordering and health checks — ensures Pipelines is ready before Open WebUI starts
-- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin; `-np 2` prevents title generation from cancelling chat requests
+- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin; `-np 2` prevents title generation from cancelling chat requests; `--ctx-checkpoints 0` disables 50-87MB checkpoint saves that block responses
+- Ollama forced to CPU via systemd override (`HIP_VISIBLE_DEVICES=-1`) — eliminates GPU contention with llama-server that caused Ollama to hang indefinitely after llama-server restarts
 - Relevance filtering via dense cosine similarity scoring (not RRF rank scores) with 0.50 threshold — unrelated queries return zero chunks
 - Response mode tags (`RAG`, `LLM`, `Web`) in every response footer for retrieval transparency
 - Query isolation — only the user's latest message is embedded for RAG, preventing conversation history from contaminating retrieval
