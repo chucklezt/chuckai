@@ -74,8 +74,9 @@ wait_for "SearXNG" "http://localhost:8081" 30
 
 # ── Step 5: Warmup — prime cold caches before Pipelines/WebUI start ──
 # Ollama embed must be warm before Pipelines serves its first RAG request.
-# If Ollama hangs here (known issue after llama-server restart), the script
-# will fail visibly rather than leaving the stack in a broken state.
+# Ollama runs CPU-only (systemd override: HIP_VISIBLE_DEVICES=-1) so GPU
+# contention with llama-server is no longer an issue. The retry logic below
+# catches edge cases like model not pulled or Ollama crash.
 log "Warming up Ollama embeddings..."
 if curl -sf --max-time 60 http://localhost:11434/api/embed \
   -d '{"model":"nomic-embed-text:v1.5","input":"warmup"}' > /dev/null 2>&1; then
