@@ -7,6 +7,7 @@ This file is read automatically by Claude Code at the start of every session. It
 ## Recent Major Change — May 2026: GPU upgrade AMD → NVIDIA
 
 **Current hardware: RTX 3090 (24GB, CUDA 13.2). Prior hardware: RX 6800 XT (16GB, ROCm 6.3).**
+**Current primary model: Qwen3.6-35B-A3B-UD-Q4_K_XL — 143 t/s generation, ~21GB VRAM. Benchmarked May 2026.**
 
 The full ChuckAI stack (Phase 1 inference, Phase 2 RAG, Phase 3 Pipelines integration) was originally designed, built, and validated for 14 months on the RX 6800 XT under ROCm. In May 2026 the GPU was swapped to an RTX 3090 and llama.cpp was rebuilt with `-DGGML_CUDA=ON`. Everything else in the stack is hardware-agnostic and carried over unchanged in principle — but one configuration error during the migration produced an instructive failure worth understanding before touching anything.
 
@@ -96,11 +97,11 @@ chuckai/
 
 ### Phase 1 — COMPLETE ✓ (on CUDA)
 
-- **llama.cpp** serving Qwen 3.5 (9B Q6_K primary, 27B Q3_K_M available) on port 8080 via RTX 3090 (CUDA)
+- **llama.cpp** serving **Qwen3.6-35B-A3B-UD-Q4_K_XL** (primary — 143 t/s, ~21GB VRAM, MoE 3B active params) on port 8080 via RTX 3090 (CUDA). 9B models available as fallback via symlink
 - **Open WebUI** v0.8.12 on port 3000 — chat, conversation history, model switching
 - **SearXNG** on port 8081 — web-augmented responses via globe icon in chat
 - **Web search** configured via Admin Panel UI (not env vars)
-- **Model switching** between 9B and 27B via symlink
+- **Model switching** via `~/models/qwen-active.gguf` symlink — 35B-A3B MoE, 9B Q4_K_M, or 9B Q6_K
 
 ### Phase 2 — COMPLETE ✓
 
@@ -123,7 +124,7 @@ chuckai/
 The performance work below is architectural — properties of Qwen 3.5 and llama.cpp, not of the GPU vendor. All flags carried forward unchanged on the CUDA build.
 
 - **RAG retrieval is fast** — 28-96ms total (embed ~28-69ms warm, Qdrant search ~3ms). Not a bottleneck.
-- **Generation speed** — characterized at ~49 tok/s on RX 6800 XT. RTX 3090 benchmarking pending; expected to be substantially higher
+- **Generation speed** — benchmarked on RTX 3090 (May 2026). Qwen3.6-35B-A3B Q4_K_XL (MoE, ~3B active params) achieves **143 t/s** at ~21GB VRAM — faster than any dense 9B tested (117 t/s Q4_K_M, 98 t/s Q6_K). MoE architecture means only ~3B parameters activate per forward pass, delivering 35B-quality reasoning at sub-10B inference cost. This is now the primary model. AMD baseline was ~49 tok/s on Q6_K 9B
 - **Prompt cache was the bottleneck** — Qwen 3.5's hybrid Mamba/attention architecture invalidates KV cache on every request. llama-server was writing cache entries (growing to 1.3+ GB) then discarding them. Cache save time escalated from 40ms to 160 seconds over a session, blocking between requests. Fixed with `--no-cache-prompt`
 - **Idle CPU spin** — llama-server busy-waits at 100% on one core without `--poll 0`. Fixed
 - **Cold start latency** — first Ollama embed after reboot takes ~750ms vs ~28ms warm. Fixed with `scripts/warmup.sh`
@@ -134,7 +135,7 @@ The performance work below is architectural — properties of Qwen 3.5 and llama
 
 - **RRF scores are rank-based, not relevance-based** — Reciprocal Rank Fusion always returns positional scores (0.500 for rank 1, 0.333 for rank 2, etc.) regardless of actual semantic similarity. Every query matched something above threshold. Fixed by using **dense cosine similarity** for threshold filtering (via Qdrant `score_threshold`) and RRF only for re-ranking results that pass
 - **Relevance threshold** — set to 0.50 cosine similarity. Unrelated queries (sports, general knowledge) score below this against technical documents and return 0 chunks. Related queries score 0.53–0.71 and retrieve correctly
-- **Single slot request cancellation** — Open WebUI sends title generation requests alongside chat prompts. With `-np 1`, the title request cancelled the active chat generation mid-stream, producing empty responses. Fixed by setting `-np 2`
+- **Single slot request cancellation** — Open WebUI sends title generation requests alongside chat prompts. With `-np 1`, the title request cancelled the active chat generation mid-stream, producing empty responses. Originally fixed by setting `-np 2`; current fix is the pipeline inlet `### Task:` filter that drops title-gen prompts before they reach llama-server, allowing `-np 1` again
 - **Conversation history contamination** — Open WebUI packs conversation history into a single user message. A 2000-char message containing prior assistant responses about microservices would match microservices chunks regardless of the actual question. Fixed by extracting only the last line when query exceeds 500 chars
 - **Title generation polluting RAG** — Open WebUI's `### Task:` title/tag generation prompts were being embedded and searched unnecessarily. Fixed by skipping these in the pipeline inlet
 
@@ -177,30 +178,72 @@ time curl -s http://localhost:11434/api/embeddings \
 
 ## llama-server Flag Reference
 
-These flags are required for Qwen 3.5 specifically. Removing any of them produces a documented failure mode.
+Current startup command runs in a tmux session named `llama` via `~/start-llama-qwen.sh`. Full flag set:
+
+**Required — Qwen architecture:**
 
 | Flag | Why required |
 |---|---|
 | `--no-cache-prompt` | Qwen 3.5 hybrid Mamba/attention invalidates KV cache every request; without it, cache saves escalate to 160s |
-| `--poll 0` | Eliminates 100% idle CPU spin on one core |
-| `-np 2` | Prevents title-generation requests from cancelling active chat |
-| `--ctx-checkpoints 0` | Disables 50-87MB checkpoint saves that block responses |
 | `--jinja` | Required for Qwen 3.5 chat template handling |
 | `-rea off` | Suppresses `<think>` tags that break JSON stream parsing |
+| `--ctx-checkpoints 0` | Disables 50–87MB checkpoint saves that block responses |
+| `--poll 0` | Eliminates 100% idle CPU spin on one core |
+
+**Serving:**
+
+| Flag | Value | Notes |
+|---|---|---|
+| `-m` | `~/models/qwen-active.gguf` | Symlink — model switch = repoint + restart |
+| `--ctx-size` | `131072` | 128K context |
+| `--n-gpu-layers` | `99` | Full GPU offload to RTX 3090 |
+| `--host` | `0.0.0.0` | Accessible from LAN, not just localhost |
+| `--port` | `8080` | OpenAI-compatible API |
+| `-np` | `1` | Single parallel slot. Pipeline filter blocks `### Task:` title-gen prompts before they reach llama-server, so single-slot cancellation is no longer an issue |
+| `-fa` | `on` | Flash Attention — better performance at long context |
+| `--cache-type-k` | `q4_0` | KV cache quantization (K) |
+| `--cache-type-v` | `q4_0` | KV cache quantization (V) |
+
+**Sampling:**
+
+| Flag | Value |
+|---|---|
+| `--temp` | `0.6` |
+| `--top-p` | `0.95` |
+| `--top-k` | `20` |
+| `--min-p` | `0.00` |
 
 ---
 
 ## VRAM Reference (RTX 3090, 24GB)
 
-| Config | Model | KV Cache | Context | Total VRAM | Headroom |
-|---|---|---|---|---|---|
-| A — Maximum quality | Q6_K 9B | q8_0 | 131K | ~18 GB | ~6 GB |
-| B — Long-context primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | ~9.5 GB |
-| C — Fast fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | ~13 GB |
-| D — Large model long context | Q3_K_M 27B | q8_0 | 64K | ~17 GB | ~7 GB |
-| E — Large model standard | Q3_K_M 27B | q4_0 | 32K | ~14 GB | ~10 GB |
+| Config | Model | KV Cache | Context | VRAM | Gen (tg128) | Status |
+|---|---|---|---|---|---|---|
+| **Primary** | **Q4_K_XL 35B-A3B MoE** | q4_0 | 131K | ~21 GB | **143 t/s** | **Active** |
+| A — Speed fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | 117 t/s | Available |
+| B — Quality fallback | Q6_K 9B | q4_0 | 131K | ~14.5 GB | 98 t/s | Available |
+| C — Large model | Q3_K_M 27B | q4_0 | 32K | ~14 GB | 38 t/s | Available |
+| D — Large model long ctx | Q3_K_M 27B | q8_0 | 64K | ~17 GB | 38 t/s | Available |
+| — Skip | Q6_K 27B (any) | — | — | ~21 GB | 33 t/s | Not recommended |
 
-Config A (Q6_K + q8_0 + 131K) was the "will spill" line on the 16GB AMD build. On the 3090 it fits comfortably and is the new default for primary work.
+**Model selection analysis:**
+
+- **35B-A3B MoE (primary):** MoE activates only ~3B parameters per forward pass — 35B quality at 143 t/s, faster than any dense 9B model. This is the MoE architecture working exactly as designed. Requires ~21GB; not viable on the 16GB AMD build.
+- **9B Q4_K_M (speed fallback):** 117 t/s — faster than Q6_K (98 t/s) with minimal quality difference. Preferred 9B option when raw speed matters.
+- **Dense 27B models:** All cluster at 38-40 t/s regardless of quantization level — memory bandwidth is the bottleneck, not compute. Q4 to Q6 on a 27B costs 7 t/s for marginal quality gain. Not worth it.
+- **Q6_K 27B — skip:** Most VRAM (~21GB, same as the 35B-A3B), slowest generation (33 t/s), worst value of any config tested. Use Q4 27B if you need a 27B, or just use the 35B-A3B instead.
+
+### Benchmark Results — RTX 3090 (May 2026)
+
+| Model | File Size | Prefill (pp512) | Generation (tg128) | VRAM | Notes |
+|---|---|---|---|---|---|
+| **Qwen3.6-35B-A3B Q4_K_XL** | 20.8 GB | 3272 t/s | **143 t/s** | ~21 GB | **Primary — MoE beats dense 9B** |
+| Qwen3.5-9B Q4_K_M | 5.5 GB | 4407 t/s | 117 t/s | ~6 GB | Speed fallback |
+| Qwen3.5-9B Q6_K | 6.9 GB | 4043 t/s | 98 t/s | ~7 GB | Quality fallback |
+| Qwen3.6-27B Q4_K_XL | 16.4 GB | 1419 t/s | 40 t/s | ~17 GB | BW-bound |
+| Qwen3.6-27B Q4_K_M | 16.3 GB | 1402 t/s | 40 t/s | ~16 GB | BW-bound |
+| Qwen3.5-27B Q3_K_M | 12.4 GB | 1326 t/s | 38 t/s | ~13 GB | BW-bound |
+| Qwen3.6-27B Q6_K | 21.0 GB | 1311 t/s | 33 t/s | ~21 GB | **Skip — worst value** |
 
 ---
 
@@ -230,22 +273,32 @@ For the AMD build instructions, see [AMD Build Reference](#amd-build-reference--
 ### llama-server lifecycle
 
 ```bash
-# Start
-bash ~/start-llama-qwen.sh &
+# Start (creates tmux session "llama"; no-op if already running)
+bash ~/start-llama-qwen.sh
+
+# Attach to watch output / logs
+tmux attach -t llama
+# Detach without killing: Ctrl-b  d
 
 # Stop
+tmux kill-session -t llama
+# or just kill the process (leaves empty tmux session):
 pkill -9 llama-server
 
 # Check
 curl -s http://localhost:8080/health
 curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])"
+
+# Tail log
+tail -f ~/llama.log
 ```
 
 ### Convenience aliases (in `~/.bashrc`)
 
 ```bash
-alias model-9b='pkill -9 llama-server; sleep 3; ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh & echo "Starting 9B..."'
-alias model-27b='pkill -9 llama-server; sleep 3; ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh & echo "Starting 27B..."'
+alias model-35b='tmux kill-session -t llama 2>/dev/null; sleep 2; ln -sf ~/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh && echo "Starting 35B-A3B MoE..."'
+alias model-9b='tmux kill-session -t llama 2>/dev/null; sleep 2; ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh && echo "Starting 9B..."'
+alias model-27b='tmux kill-session -t llama 2>/dev/null; sleep 2; ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf; bash ~/start-llama-qwen.sh && echo "Starting 27B..."'
 alias model-status='curl -s http://localhost:8080/v1/models | python3 -c "import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])"'
 ```
 
@@ -328,7 +381,7 @@ Do NOT use `PIPELINES_URLS` — Open WebUI v0.8.12 ignores that env var.
 | Only 100GB disk visible | LVM not extended | `sudo lvextend -l +100%FREE` then `resize2fs` |
 | "Pipelines Not Detected" in UI | `PIPELINES_URLS` env var used | Add pipelines URL to `OPENAI_API_BASE_URLS` |
 | Pipelines returns 401 | Missing API key | Use `0p3n-w3bu!` in `OPENAI_API_KEYS` |
-| Chat returns empty/hangs | Title gen cancels chat (single slot) | Use `-np 2` in `start-llama-qwen.sh` |
+| Chat returns empty/hangs | Title gen cancels chat with `-np 1` | Pipeline inlet filters `### Task:` prompts before they reach llama-server — verify pipeline is running and registered |
 | RAG injects irrelevant context | RRF rank scores don't reflect relevance | Use dense cosine similarity for `score_threshold` |
 | RAG matches wrong content on follow-up | Conversation history embedded as query | Pipeline extracts last line only when query > 500 chars |
 | Pipelines health check returns 403 | `/models` endpoint requires auth | Include `Authorization: Bearer 0p3n-w3bu!` header |

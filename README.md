@@ -10,6 +10,22 @@
 
 **GPU upgrade: AMD RX 6800 XT → NVIDIA RTX 3090 (24GB).** The original ChuckAI build ran on a 16GB RX 6800 XT (RDNA 2, gfx1030) under ROCm 6.3. After 14 months of production use that validated the full Phase 1/2/3 stack on AMD hardware, the system was upgraded to an RTX 3090 for the larger 24GB VRAM envelope and a smoother CUDA toolchain. The AMD-era build knowledge is preserved in detail in the [AMD Build Reference](#amd-build-reference--rx-6800-xt-rocm-63) appendix below — every flag, every workaround, every "why does this fail silently" lesson — because that knowledge stays relevant whenever AMD AI hardware reappears in the conversation (Strix Halo, MI300X, RDNA 4, ROCm 7, customer environments).
 
+**Benchmark results drove a primary model change.** After running llama-bench across the full model collection on the 3090, the new primary is `Qwen3.6-35B-A3B-UD-Q4_K_XL` — a 35B Mixture-of-Experts model that activates only ~3B parameters per forward pass. It achieves **143 t/s generation** at ~21GB VRAM — faster than any dense 9B model tested — while delivering 35B-class reasoning quality. The 24GB 3090 is the minimum viable hardware; it would not have fit on the 16GB RX 6800 XT. Three insights from the benchmark run:
+
+1. **MoE beats dense 9B.** 143 t/s at 35B quality vs. 117 t/s (9B Q4_K_M) or 98 t/s (9B Q6_K). The architecture working exactly as designed.
+2. **For quick tasks, 9B Q4_K_M beats Q6_K.** 117 t/s vs. 98 t/s with minimal quality difference — Q4_K_M is the better 9B fallback.
+3. **Dense 27B models are memory-bandwidth-bound.** All cluster at 38–40 t/s regardless of quantization level. Going Q4 → Q6 on any 27B costs 7 t/s for marginal quality gain. Q6_K 27B is the worst value in the collection: ~21GB VRAM (same as the 35B-A3B), slowest generation (33 t/s), no quality upside. Skip it.
+
+| Model | File Size | Prefill (pp512) | Generation (tg128) | VRAM | Notes |
+|---|---|---|---|---|---|
+| **Qwen3.6-35B-A3B Q4_K_XL** | 20.8 GB | 3272 t/s | **143 t/s** | ~21 GB | **Primary** |
+| Qwen3.5-9B Q4_K_M | 5.5 GB | 4407 t/s | 117 t/s | ~6 GB | Speed fallback |
+| Qwen3.5-9B Q6_K | 6.9 GB | 4043 t/s | 98 t/s | ~7 GB | Quality fallback |
+| Qwen3.6-27B Q4_K_XL | 16.4 GB | 1419 t/s | 40 t/s | ~17 GB | BW-bound |
+| Qwen3.6-27B Q4_K_M | 16.3 GB | 1402 t/s | 40 t/s | ~16 GB | BW-bound |
+| Qwen3.5-27B Q3_K_M | 12.4 GB | 1326 t/s | 38 t/s | ~13 GB | BW-bound |
+| Qwen3.6-27B Q6_K | 21.0 GB | 1311 t/s | 33 t/s | ~21 GB | **Skip — worst value** |
+
 The migration surfaced one significant gotcha worth calling out up front: **the systemd override that forces Ollama to CPU was vendor-specific to ROCm and silently became a no-op under CUDA.** Ollama loaded the embedding model onto the 3090, contended with llama-server for VRAM and compute, and Pipelines' 5-second embed timeout fired on every RAG request — silently breaking retrieval while everything else looked healthy. The fix and the diagnostic path are documented in the [Troubleshooting](#troubleshooting-quick-reference) section. The override now covers both vendor families so a future swap doesn't repeat the lesson.
 
 ---
@@ -41,8 +57,8 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 │             │  │                 │  │                │
 │ qwen-active │  │ Web-augmented   │  │ rag_pipeline   │
 │ (symlink)   │  │ search          │  │ Hybrid BM25 +  │
-│ RTX 3090    │  │                 │  │ semantic + RRF │
-│ (CUDA 13.2) │  │                 │  │                │
+│ 35B-A3B MoE │  │                 │  │ semantic + RRF │
+│ RTX 3090    │  │                 │  │                │
 └─────────────┘  └─────────────────┘  └───────┬────────┘
                                               │
        ┌──────────────────────────────────────┘
@@ -94,11 +110,12 @@ The 8GB additional VRAM on the 3090 lifts the ceiling on practical configuration
 
 ### Model Files
 
-| File | Quantization | Size | Notes |
-|---|---|---|---|
-| `Qwen3.5-9B-Q6_K.gguf` | Q6_K | 7.0 GB | Primary — high quality, fully on GPU |
-| `Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Q4_K_M | 5.5 GB | Fallback — lower VRAM, faster load |
-| `qwen3.5-27b-q3_K_M.gguf` | Q3_K_M | 13.4 GB | Custom quantized — comfortably fits on 3090 |
+| File | Quantization | Size | Gen Speed | Notes |
+|---|---|---|---|---|
+| `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` | Q4_K_XL | 20.8 GB | **143 t/s** | **Primary** — MoE, ~3B active params, 35B quality. Faster than any dense 9B |
+| `Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Q4_K_M | 5.5 GB | 117 t/s | **Speed fallback** — fastest dense model, recommended 9B choice |
+| `Qwen3.5-9B-Q6_K.gguf` | Q6_K | 6.9 GB | 98 t/s | Quality fallback — marginal gain over Q4_K_M at 19 t/s cost |
+| `qwen3.5-27b-q3_K_M.gguf` | Q3_K_M | 12.4 GB | 38 t/s | Large model option — BW-bound like all dense 27B; Q4 quantization is the right pick |
 
 ### Active Model Symlink
 
@@ -108,29 +125,37 @@ llama-server loads `~/models/qwen-active.gguf` — a symlink that points to whic
 # Current state
 ls -la ~/models/qwen-active.gguf
 
-# Switch to 27B Q3_K_M
-ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
+# Switch to 35B-A3B MoE Q4_K_XL (primary — 143 t/s, ~21GB)
+ln -sf ~/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf ~/models/qwen-active.gguf
 
-# Switch to 9B Q4_K_M (lower VRAM)
+# Switch to 9B Q4_K_M (low-VRAM fallback — ~6GB)
 ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf
 
-# Switch back to 9B Q6_K (primary)
+# Switch to 9B Q6_K (quality fallback — ~7GB)
 ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+
+# Switch to 27B Q3_K_M (large model — ~13GB)
+ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
 ```
 
 ### VRAM Configurations
 
-24GB on the 3090 reshapes the configuration table. Previously "will spill" rows are now viable; the AMD-era table is retained in the [appendix](#amd-build-reference--rx-6800-xt-rocm-63) for historical reference.
+Benchmarks on the 3090 selected a new primary model: Qwen3.6-35B-A3B-UD-Q4_K_XL, a Mixture-of-Experts model that activates only ~3B parameters per forward pass despite 35B total — yielding 35B-quality reasoning at 143 t/s, faster than any dense 9B model tested. The AMD-era table is retained in the [appendix](#amd-build-reference--rx-6800-xt-rocm-63) for historical reference.
 
-| Config | Model | KV Cache | Context | Total VRAM | Headroom | Status |
+| Config | Model | KV Cache | Context | VRAM | Gen Speed | Status |
 |---|---|---|---|---|---|---|
-| A — Maximum quality | Q6_K 9B | q8_0 | 131K | ~18 GB | ~6 GB | **Active** (was "will spill" on AMD) |
-| B — Long-context primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | ~9.5 GB | Available |
-| C — Fast fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | ~13 GB | Available |
-| D — Large model long context | Q3_K_M 27B | q8_0 | 64K | ~17 GB | ~7 GB | New — not viable on 16GB |
-| E — Large model standard | Q3_K_M 27B | q4_0 | 32K | ~14 GB | ~10 GB | Available |
+| **Primary** | **Q4_K_XL 35B-A3B MoE** | q4_0 | 131K | ~21 GB | **143 t/s** | **Active** |
+| A — Speed fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | 117 t/s | Available |
+| B — Quality fallback | Q6_K 9B | q4_0 | 131K | ~14.5 GB | 98 t/s | Available |
+| C — Large model | Q3_K_M 27B | q4_0 | 32K | ~14 GB | 38 t/s | Available |
+| D — Large model long ctx | Q3_K_M 27B | q8_0 | 64K | ~17 GB | 38 t/s | Available |
+| — | Q6_K 27B (any) | — | — | ~21 GB | 33 t/s | **Not recommended** |
 
-**Why Q6_K with q8_0 KV cache is the new default:** On the 3090 the previous AMD-era "Config B will spill" entry now fits with 6 GB of headroom to spare. Q6_K delivers sharper reasoning and more accurate code than Q4_K_M; q8_0 KV cache improves attention fidelity in long multi-turn sessions versus q4_0. With Ollama forced to CPU, llama-server gets the full 24 GB of the 3090 — no contention.
+**Model selection notes:**
+- **35B-A3B MoE** is primary — 35B quality, 143 t/s. Faster than any dense 9B because MoE activates ~3B parameters per token. Requires ~21GB.
+- **9B Q4_K_M** is the recommended speed fallback — 117 t/s, beats Q6_K (98 t/s) with negligible quality loss.
+- **Dense 27B models** are memory-bandwidth-bound: all deliver 38–40 t/s regardless of quantization. Q4 vs. Q6 on a 27B is not worth the 7 t/s cost.
+- **Q6_K 27B** is the worst value in the collection — same ~21GB VRAM as the 35B-A3B, slowest generation (33 t/s). Skip it.
 
 ---
 
@@ -159,7 +184,7 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
 - Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
 - Sequenced startup script (`scripts/startup.sh`) with dependency ordering and health checks — ensures Pipelines is ready before Open WebUI starts
-- Performance-tuned llama-server: `--no-cache-prompt`, `--poll 0`, `-np 2`, `--ctx-checkpoints 0` (see [llama-server flags](#llama-server-flag-reference))
+- Performance-tuned llama-server: `--no-cache-prompt`, `--poll 0`, `-np 1`, `--ctx-checkpoints 0`, `-fa on`, `--cache-type-k/v q4_0` (see [llama-server flags](#llama-server-flag-reference))
 - **Ollama forced to CPU via systemd override (both CUDA and HIP variants)** — eliminates GPU contention with llama-server that caused Ollama embed calls to time out and silently break RAG
 - Relevance filtering via dense cosine similarity scoring (not RRF rank scores) with 0.50 threshold — unrelated queries return zero chunks
 - Response mode tags (`RAG`, `LLM`, `Web`) in every response footer for retrieval transparency
@@ -239,7 +264,7 @@ huggingface-cli download bartowski/Qwen_Qwen3.5-9B-Instruct-GGUF \
 ### 5. Create the active model symlink
 
 ```bash
-ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
+ln -sf ~/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf ~/models/qwen-active.gguf
 ```
 
 ### 6. Start the full stack
@@ -308,16 +333,40 @@ Verify in Admin Panel → Settings → Pipelines — you should see the "RAG Ret
 
 ## llama-server Flag Reference
 
-These flags are required for Qwen 3.5 specifically. Removing any of them produces a documented failure mode.
+llama-server runs in a **tmux session** named `llama` via `~/start-llama-qwen.sh`. The script creates the session if it doesn't exist; if it's already running it prints the attach command and exits.
+
+**Required — Qwen architecture (removing any causes a documented failure):**
 
 | Flag | Why it's required |
 |---|---|
-| `--no-cache-prompt` | Qwen 3.5's hybrid Mamba/attention architecture invalidates KV cache on every request. Without this, cache save time escalates to 160 seconds per request |
-| `--poll 0` | Eliminates 100% idle CPU spin on one core |
-| `-np 2` | Prevents Open WebUI title-generation requests from cancelling the active chat generation mid-stream |
-| `--ctx-checkpoints 0` | Disables 50–87 MB checkpoint saves that block responses |
+| `--no-cache-prompt` | Qwen 3.5's hybrid Mamba/attention architecture invalidates KV cache on every request. Without this, cache save time escalates to 160 seconds |
 | `--jinja` | Required for Qwen 3.5 chat template handling |
 | `-rea off` | Suppresses `<think>` tags that break JSON stream parsing in Pipelines |
+| `--ctx-checkpoints 0` | Disables 50–87 MB checkpoint saves that block responses |
+| `--poll 0` | Eliminates 100% idle CPU spin on one core |
+
+**Serving and performance:**
+
+| Flag | Value | Notes |
+|---|---|---|
+| `-m` | `~/models/qwen-active.gguf` | Symlink — model switching requires no config changes |
+| `--ctx-size` | `131072` | 128K context window |
+| `--n-gpu-layers` | `99` | Full offload to RTX 3090 |
+| `--host` | `0.0.0.0` | Accessible from LAN |
+| `--port` | `8080` | OpenAI-compatible API |
+| `-np` | `1` | Single parallel slot. Pipeline filter skips `### Task:` title-gen prompts, so they never compete for the slot |
+| `-fa` | `on` | Flash Attention — performance improvement at long context |
+| `--cache-type-k` | `q4_0` | KV cache quantization (K) — matches VRAM table |
+| `--cache-type-v` | `q4_0` | KV cache quantization (V) |
+
+**Sampling:**
+
+| Flag | Value |
+|---|---|
+| `--temp` | `0.6` |
+| `--top-p` | `0.95` |
+| `--top-k` | `20` |
+| `--min-p` | `0.00` |
 
 ---
 
@@ -326,29 +375,46 @@ These flags are required for Qwen 3.5 specifically. Removing any of them produce
 ### Start and stop llama-server
 
 ```bash
-# Start
-bash ~/start-llama-qwen.sh &
+# Start (creates tmux session "llama"; no-op if already running)
+bash ~/start-llama-qwen.sh
 
-# Stop
-pkill -9 llama-server
+# Attach to watch output
+tmux attach -t llama
+# Detach without killing: Ctrl-b  d
+
+# Stop (kills session and process)
+tmux kill-session -t llama
 
 # Check status
 curl -s http://localhost:8080/health
 pgrep -fa llama-server
+
+# Tail log
+tail -f ~/llama.log
 ```
 
 ### Switching models via symlink
 
 ```bash
-# Switch to 27B — complex reasoning tasks
-pkill -9 llama-server
-ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
-sleep 3 && bash ~/start-llama-qwen.sh &
+# Switch to 35B-A3B MoE Q4_K_XL — primary (143 t/s, ~21GB)
+tmux kill-session -t llama 2>/dev/null; sleep 2
+ln -sf ~/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf ~/models/qwen-active.gguf
+bash ~/start-llama-qwen.sh
 
-# Switch to 9B Q6_K — primary (coding, chat, RAG)
-pkill -9 llama-server
+# Switch to 9B Q4_K_M — speed fallback (~6GB, 117 t/s)
+tmux kill-session -t llama 2>/dev/null; sleep 2
+ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf
+bash ~/start-llama-qwen.sh
+
+# Switch to 9B Q6_K — quality fallback (~7GB, 98 t/s)
+tmux kill-session -t llama 2>/dev/null; sleep 2
 ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
-sleep 3 && bash ~/start-llama-qwen.sh &
+bash ~/start-llama-qwen.sh
+
+# Switch to 27B Q3_K_M — large model option (~13GB)
+tmux kill-session -t llama 2>/dev/null; sleep 2
+ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
+bash ~/start-llama-qwen.sh
 
 # Confirm what llama-server loaded
 curl -s http://localhost:8080/v1/models | python3 -c \
@@ -434,7 +500,7 @@ nvidia-smi --query-gpu=memory.used,memory.free \
 | Web search hangs, no response | Web search env vars set | Remove from docker-compose, configure via UI only |
 | "Pipelines Not Detected" in UI | `PIPELINES_URLS` env var used | Add pipelines URL to `OPENAI_API_BASE_URLS` instead |
 | Pipelines returns 401 | Missing API key | Use `0p3n-w3bu!` in `OPENAI_API_KEYS` |
-| Chat prompt returns empty/hangs | Title generation cancels chat (single slot) | Use `-np 2` in `start-llama-qwen.sh` |
+| Chat prompt returns empty/hangs | Title generation cancels chat with `-np 1` | Pipeline inlet filters `### Task:` prompts — verify Pipelines is running and registered in Open WebUI |
 | RAG injects irrelevant context | RRF rank scores don't reflect relevance | Use dense cosine similarity for threshold filtering (`score_threshold` in Qdrant query) |
 | Services fail after reboot | Wrong startup order | Run `bash ~/chuckai/scripts/startup.sh` |
 | `nvidia-smi` shows GPU at 23+ GB used | Could be normal (Q6_K + q8_0 + 131K) or contention | Check process list — only llama-server should appear |
@@ -460,12 +526,6 @@ nvidia-smi --query-gpu=memory.used,memory.free \
 
 ### Phase 3 — Document Output
 On-demand generation of Word documents, PowerPoint presentations, and PDFs from model output. Pandoc + LibreOffice conversion triggered by natural language requests in chat.
-
-### Performance Re-tuning on RTX 3090
-The performance work documented for the AMD build (prompt cache, idle CPU spin, cold start) carries forward unchanged — they're architectural properties of Qwen 3.5 and llama.cpp, not vendor-specific. Worth a fresh benchmark pass on the 3090 to characterize:
-- Generation token/s at Q6_K + q8_0 + 131K (likely substantially faster than the AMD build's ~49 tok/s)
-- Whether Config D (27B + q8_0 + 64K) is viable in practice or memory-bound
-- Cold-start cost differential between CUDA and ROCm builds
 
 ### Future
 - Image generation with Flux.1
