@@ -1,8 +1,16 @@
 # ChuckAI — Private AI Infrastructure
 
-**A production-grade, self-hosted AI inference and RAG stack running on bare metal Ubuntu 22.04 with AMD GPU acceleration. Zero cloud dependency. Zero per-token cost. Full data sovereignty.**
+**A production-grade, self-hosted AI inference and RAG stack running on bare metal Ubuntu 22.04 with NVIDIA GPU acceleration. Zero cloud dependency. Zero per-token cost. Full data sovereignty.**
 
 > Designed and built by [Chuck Tsocanos](https://chucktsocanos.com) — Technology Executive, AI Strategist, Cloud Transformation Leader.
+
+---
+
+## What's New — May 2026
+
+**GPU upgrade: AMD RX 6800 XT → NVIDIA RTX 3090 (24GB).** The original ChuckAI build ran on a 16GB RX 6800 XT (RDNA 2, gfx1030) under ROCm 6.3. After 14 months of production use that validated the full Phase 1/2/3 stack on AMD hardware, the system was upgraded to an RTX 3090 for the larger 24GB VRAM envelope and a smoother CUDA toolchain. The AMD-era build knowledge is preserved in detail in the [AMD Build Reference](#amd-build-reference--rx-6800-xt-rocm-63) appendix below — every flag, every workaround, every "why does this fail silently" lesson — because that knowledge stays relevant whenever AMD AI hardware reappears in the conversation (Strix Halo, MI300X, RDNA 4, ROCm 7, customer environments).
+
+The migration surfaced one significant gotcha worth calling out up front: **the systemd override that forces Ollama to CPU was vendor-specific to ROCm and silently became a no-op under CUDA.** Ollama loaded the embedding model onto the 3090, contended with llama-server for VRAM and compute, and Pipelines' 5-second embed timeout fired on every RAG request — silently breaking retrieval while everything else looked healthy. The fix and the diagnostic path are documented in the [Troubleshooting](#troubleshooting-quick-reference) section. The override now covers both vendor families so a future swap doesn't repeat the lesson.
 
 ---
 
@@ -23,7 +31,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
                           │ http://192.168.1.59:3000
 ┌─────────────────────────▼───────────────────────────────┐
 │              Open WebUI v0.8.12  (port 3000)             │
-│         Chat UI · Web Search · Model Switching           │
+│         Chat UI · Web Search · Pipelines RAG             │
 └──────┬──────────────────┬──────────────────┬────────────┘
        │                  │                  │
        ▼                  ▼                  ▼
@@ -31,10 +39,10 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 │ llama-server│  │    SearXNG      │  │  Pipelines     │
 │  port 8080  │  │   port 8081     │  │  port 9099     │
 │             │  │                 │  │                │
-│ qwen-active │  │ Web-augmented   │  │ RAG filter     │
-│ (symlink)   │  │ search          │  │ Hybrid search  │
-│ AMD RX 6800 │  │                 │  │ + RRF fusion   │
-│ XT (ROCm)   │  │                 │  │                │
+│ qwen-active │  │ Web-augmented   │  │ rag_pipeline   │
+│ (symlink)   │  │ search          │  │ Hybrid BM25 +  │
+│ RTX 3090    │  │                 │  │ semantic + RRF │
+│ (CUDA 13.2) │  │                 │  │                │
 └─────────────┘  └─────────────────┘  └───────┬────────┘
                                               │
        ┌──────────────────────────────────────┘
@@ -55,12 +63,15 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 
 | Component | Spec | Notes |
 |---|---|---|
-| CPU | Intel i7-10700 — 8C/16T | Model loading, CPU-offloaded layers |
-| GPU | AMD RX 6800 XT — 16GB GDDR6 | Primary inference engine (RDNA 2, gfx1030) |
+| CPU | Intel i7-10700 — 8C/16T | Model loading, CPU-offloaded layers, CPU-bound Ollama embeddings |
+| **GPU (current)** | **NVIDIA RTX 3090 — 24GB GDDR6X** | **Primary inference engine (CUDA 13.2, driver 595.58.03)** |
+| GPU (prior) | AMD RX 6800 XT — 16GB GDDR6 | Original build; see [AMD Build Reference](#amd-build-reference--rx-6800-xt-rocm-63) |
 | RAM | 64GB DDR4 | Headroom for large models + RAG services |
-| Storage | 4TB NVMe SSD | Model collection + vector store |
-| OS | Ubuntu 22.04.5 LTS (Jammy) | ROCm 6.3 requires Jammy specifically |
-| Total build cost | ~$800 used | RX 6800 XT is the key purchase |
+| Storage | 4TB NVMe SSD | Model collection + vector store + document corpus |
+| OS | Ubuntu 22.04.5 LTS (Jammy) | Originally pinned for ROCm 6.3; retained on CUDA build for stability |
+| Network | Static IP 192.168.1.59 | Set via netplan |
+
+The 8GB additional VRAM on the 3090 lifts the ceiling on practical configurations. The "will spill" row from the AMD build table is now comfortably in range; see the updated [VRAM Configurations](#vram-configurations) table.
 
 ---
 
@@ -68,14 +79,14 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 
 | Component | Software | Version | Purpose |
 |---|---|---|---|
-| Inference | llama.cpp | build 8454 | GPU-accelerated LLM serving via ROCm |
+| Inference | llama.cpp | latest (CUDA build) | GPU-accelerated LLM serving via CUDA |
 | Chat UI | Open WebUI | v0.8.12 | Full-featured chat interface |
 | Web Search | SearXNG | 2026.3.18 | Self-hosted web search augmentation |
-| Containers | Docker CE | 29.3.0 | Hosts WebUI and SearXNG |
-| Embeddings | Ollama + nomic-embed-text:v1.5 | 0.18.2 | RAG embeddings on CPU (forced via systemd override) |
+| Containers | Docker CE | 29.3.0 | Hosts WebUI, SearXNG, Qdrant, Tika, Pipelines |
+| Embeddings | Ollama + nomic-embed-text:v1.5 | 0.18.2 | RAG embeddings on **CPU** (forced via systemd override) |
 | Vector DB | Qdrant | latest | On-disk HNSW vector search |
 | Doc Parser | Apache Tika | latest-full | Universal document extraction |
-| RAG Pipeline | Open WebUI Pipelines | main | Hybrid retrieval filter with RRF fusion |
+| RAG Pipeline | Open WebUI Pipelines | main | Hybrid retrieval filter with cosine threshold + RRF re-rank |
 
 ---
 
@@ -87,9 +98,7 @@ This project, as outlined in [this blog post](https://chucktsocanos.com/#blog/bu
 |---|---|---|---|
 | `Qwen3.5-9B-Q6_K.gguf` | Q6_K | 7.0 GB | Primary — high quality, fully on GPU |
 | `Qwen_Qwen3.5-9B-Q4_K_M.gguf` | Q4_K_M | 5.5 GB | Fallback — lower VRAM, faster load |
-| `qwen3.5-27b-q3_K_M.gguf` | Q3_K_M | 13.4 GB | Custom quantized — capable, still on GPU |
-
-> **Note:** `qwen3.5-27b-f16.gguf` (54GB) is the intermediate conversion artifact used to produce the Q3_K_M. It can be safely deleted once the Q3_K_M is confirmed working — `rm ~/models/qwen3.5-27b-f16.gguf` recovers 54GB.
+| `qwen3.5-27b-q3_K_M.gguf` | Q3_K_M | 13.4 GB | Custom quantized — comfortably fits on 3090 |
 
 ### Active Model Symlink
 
@@ -98,7 +107,6 @@ llama-server loads `~/models/qwen-active.gguf` — a symlink that points to whic
 ```bash
 # Current state
 ls -la ~/models/qwen-active.gguf
-# qwen-active.gguf -> /home/chuck/models/Qwen3.5-9B-Q6_K.gguf
 
 # Switch to 27B Q3_K_M
 ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf
@@ -112,19 +120,17 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 
 ### VRAM Configurations
 
+24GB on the 3090 reshapes the configuration table. Previously "will spill" rows are now viable; the AMD-era table is retained in the [appendix](#amd-build-reference--rx-6800-xt-rocm-63) for historical reference.
+
 | Config | Model | KV Cache | Context | Total VRAM | Headroom | Status |
 |---|---|---|---|---|---|---|
-| A — Fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | ~5.3 GB | Available |
-| B — Will spill | Q6_K 9B | q8_0 | 131K | ~16.0 GB | ~0 GB | Avoid |
-| C — Primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | ~1.5 GB | Active |
-| D — Comfortable | Q6_K 9B | q4_0 | 32K | ~8.7 GB | ~7.3 GB | Use for non-coding |
-| E — Large model | Q3_K_M 27B | q4_0 | 32K | ~14.0 GB | ~2.0 GB | Use for complex tasks |
+| A — Maximum quality | Q6_K 9B | q8_0 | 131K | ~18 GB | ~6 GB | **Active** (was "will spill" on AMD) |
+| B — Long-context primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | ~9.5 GB | Available |
+| C — Fast fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | ~13 GB | Available |
+| D — Large model long context | Q3_K_M 27B | q8_0 | 64K | ~17 GB | ~7 GB | New — not viable on 16GB |
+| E — Large model standard | Q3_K_M 27B | q4_0 | 32K | ~14 GB | ~10 GB | Available |
 
-**Config C (Active):** Q6_K at 131K context with q4_0 KV cache sits at ~14.5GB (84% VRAM). Confirmed fully on GPU — `load_tensors: offloaded 33/33 layers to GPU`. The 1.5GB headroom is tight but sufficient for coding sessions up to ~75K tokens. Monitor with `watch -n 2 "rocm-smi --showmeminfo vram | grep Used"` during long sessions.
-
-> **Why Q6_K over Q4_K_M?** Q6_K delivers meaningfully better output quality — sharper reasoning, more accurate code, better instruction following — at only 1.5GB additional VRAM over Q4_K_M. The quality improvement is particularly noticeable in coding and multi-step reasoning tasks. The tradeoff is reduced VRAM headroom at 131K context.
-
-> **Why not q8_0 KV cache?** At 131K context, q8_0 KV cache consumes an additional ~3GB versus q4_0, pushing total VRAM to the ceiling (~16GB) with effectively zero headroom. q4_0 KV cache at this context size is the correct choice. If context is reduced to 32K, q8_0 becomes viable and improves attention fidelity in long multi-turn sessions.
+**Why Q6_K with q8_0 KV cache is the new default:** On the 3090 the previous AMD-era "Config B will spill" entry now fits with 6 GB of headroom to spare. Q6_K delivers sharper reasoning and more accurate code than Q4_K_M; q8_0 KV cache improves attention fidelity in long multi-turn sessions versus q4_0. With Ollama forced to CPU, llama-server gets the full 24 GB of the 3090 — no contention.
 
 ---
 
@@ -132,29 +138,29 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 
 ### Phase 1 — Complete
 
-- GPU-accelerated inference via ROCm on AMD RX 6800 XT
+- GPU-accelerated inference via CUDA on RTX 3090
 - OpenAI-compatible API at `http://192.168.1.59:8080/v1`
 - Full chat UI with conversation history, system prompts, and model switching
 - Live web search augmentation via self-hosted SearXNG
-- Dual-model setup — switch between 9B (fast) and 27B (capable) via symlink
+- Dual-model setup — switch between 9B and 27B via symlink
 - Accessible from any device on the local network
 
 ### Phase 2 — Complete
 
-- Hybrid BM25 + semantic vector search with Reciprocal Rank Fusion
-- 2–3TB document corpus support with tiered on-disk HNSW indexing (docs_hot + docs_cold)
+- Hybrid BM25 + semantic vector search with Reciprocal Rank Fusion (for re-ranking) and dense cosine similarity (for threshold filtering)
+- 2–3TB document corpus support with tiered on-disk HNSW indexing (`docs_hot` + `docs_cold`)
 - Universal document parsing: PDF, DOCX, PPTX, XLSX, EPUB, email, HTML
 - EPUB chapter-aware extraction with per-chapter metadata via ebooklib
 - Incremental ingestion — drop files via SFTP from Mac, indexed automatically via file watcher
-- Symlink-based document storage (`~/documents/`) — starts on NVMe, migrates to dedicated SATA drive with a single `ln -sf`
+- Symlink-based document storage (`~/documents/`) — starts on NVMe, migrates to dedicated SATA with a single `ln -sf`
 - RAG retrieval integrated into Open WebUI via Pipelines filter — every chat query searches the knowledge base
 - Pipelines server registered as an OpenAI API connection (not a separate Pipelines URL)
 - Inline source citations and chapter references in model responses, with a Sources footer listing all retrieved documents
 - Tuned retrieval: 1500-char chunks, top_k=10, boilerplate filtering — validated with *Microservices Patterns* by Chris Richardson (895 chunks, 35s ingestion)
 - Pipeline timing logs for retrieval latency monitoring (embed, search, total per query)
 - Sequenced startup script (`scripts/startup.sh`) with dependency ordering and health checks — ensures Pipelines is ready before Open WebUI starts
-- Performance-tuned llama-server: `--no-cache-prompt` eliminates 38–160s cache save stalls caused by Qwen 3.5's hybrid Mamba/attention architecture invalidating KV cache on every request; `--poll 0` eliminates 100% idle CPU spin; `-np 2` prevents title generation from cancelling chat requests; `--ctx-checkpoints 0` disables 50-87MB checkpoint saves that block responses
-- Ollama forced to CPU via systemd override (`HIP_VISIBLE_DEVICES=-1`) — eliminates GPU contention with llama-server that caused Ollama to hang indefinitely after llama-server restarts
+- Performance-tuned llama-server: `--no-cache-prompt`, `--poll 0`, `-np 2`, `--ctx-checkpoints 0` (see [llama-server flags](#llama-server-flag-reference))
+- **Ollama forced to CPU via systemd override (both CUDA and HIP variants)** — eliminates GPU contention with llama-server that caused Ollama embed calls to time out and silently break RAG
 - Relevance filtering via dense cosine similarity scoring (not RRF rank scores) with 0.50 threshold — unrelated queries return zero chunks
 - Response mode tags (`RAG`, `LLM`, `Web`) in every response footer for retrieval transparency
 - Query isolation — only the user's latest message is embedded for RAG, preventing conversation history from contaminating retrieval
@@ -171,10 +177,10 @@ ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 
 ### Prerequisites
 
-- Ubuntu 22.04 LTS (Jammy) — not 24.04, ROCm repos require Jammy
-- AMD ROCm 6.3 installed
+- Ubuntu 22.04 LTS (Jammy)
+- NVIDIA driver 595+ with CUDA 13.x
 - Docker CE and Docker Compose v2
-- llama.cpp built from source with HIP backend
+- llama.cpp built from source with CUDA backend (`-DGGML_CUDA=ON`)
 - [The blog post](https://chucktsocanos.com/#blog/building-private-ai-server-part1)
 - [The build document](https://chucktsocanos.com/downloads/ubuntu-ai-setup-procedure.docx)
 
@@ -195,7 +201,26 @@ cp configs/searxng-settings.yml ~/searxng/settings.yml
 chmod +x ~/start-llama-qwen.sh
 ```
 
-### 3. Download models
+### 3. Install the Ollama CPU override (critical)
+
+```bash
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null <<'EOF'
+[Service]
+# NVIDIA (current hardware)
+Environment="CUDA_VISIBLE_DEVICES="
+Environment="OLLAMA_NUM_GPU=0"
+# AMD ROCm (legacy / future swap protection)
+Environment="HIP_VISIBLE_DEVICES=-1"
+Environment="ROCR_VISIBLE_DEVICES=-1"
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+**Why both vendor families:** A vendor-specific override silently becomes a no-op when the GPU is swapped to a different vendor. Setting both prevents the failure mode that took down RAG during the 3090 migration.
+
+### 4. Download models
 
 ```bash
 mkdir -p ~/models
@@ -205,26 +230,25 @@ pip3 install huggingface_hub
 huggingface-cli download unsloth/Qwen3.5-9B-GGUF Qwen3.5-9B-Q6_K.gguf \
   --local-dir /home/$USER/models/
 
-# Fallback model — Q4_K_M (lower VRAM)
+# Fallback model — Q4_K_M (lower VRAM, faster load)
 huggingface-cli download bartowski/Qwen_Qwen3.5-9B-Instruct-GGUF \
   Qwen_Qwen3.5-9B-Instruct-Q4_K_M.gguf \
   --local-dir /home/$USER/models/
 ```
 
-### 4. Create the active model symlink
+### 5. Create the active model symlink
 
 ```bash
-# Point to Q6_K as primary
 ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 ```
 
-### 5. Start the full stack
+### 6. Start the full stack
 
 ```bash
 bash ~/chuckai/scripts/startup.sh
 ```
 
-The startup script sequences all services in dependency order with health checks between each stage. It also works as a clean restart — it kills all existing services before starting.
+**Always use the startup script, never plain `docker compose up -d`.** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, RAG silently stops working — the filter is not retried.
 
 **Startup sequence:**
 
@@ -237,20 +261,6 @@ The startup script sequences all services in dependency order with health checks
 | 5 | Warmup (Ollama, Qdrant, llama-server) | Prime cold caches with auto-retry if Ollama hangs |
 | 6 | Pipelines | RAG filter. Needs warm Ollama + ready Qdrant |
 | 7 | Open WebUI | Must discover Pipelines filter on startup |
-
-**Why the order matters:** Open WebUI discovers the Pipelines RAG filter at startup. If Open WebUI starts before Pipelines is ready, RAG silently stops working. Ollama can hang after llama-server restarts — the warmup step catches this with a 60s timeout and auto-restarts Ollama before Pipelines depends on it.
-
-**Health check endpoints:**
-
-| Service | Health URL | What it proves |
-|---|---|---|
-| Ollama | `/api/version` | API is accepting requests |
-| llama-server | `/health` | Model is loaded and ready |
-| Qdrant | `/healthz` | Vector DB is ready |
-| Tika | `/tika` | Parser is accepting requests |
-| SearXNG | `localhost:8081` | Web server is up |
-| Pipelines | `/models` + auth header | API is up and authenticating |
-| Open WebUI | `localhost:3000` | Frontend is serving |
 
 ### 7. Configure web search
 
@@ -265,21 +275,17 @@ The globe icon will appear in the chat input bar. Click it to enable web-augment
 ### 8. Set up RAG ingestion
 
 ```bash
-# Create document directories
 mkdir -p ~/documents/inbox ~/documents/inbox_priority
 
-# Start Ollama and pull the embedding model
 sudo systemctl enable ollama && sudo systemctl start ollama
 ollama pull nomic-embed-text:v1.5
 
-# Create Python venv and install dependencies
 cd ~/chuckai
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r ingest/requirements.txt
 
-# Start the file watcher (processes existing files, then watches for new ones)
 .venv/bin/python -m ingest.watcher
 ```
 
@@ -287,7 +293,7 @@ Drop files into `~/documents/inbox_priority/` (queried first) or `~/documents/in
 
 ### 9. Verify Pipelines connection
 
-The Pipelines server (RAG filter) is started automatically by `docker compose up -d`. The connection to Open WebUI is configured via environment variables in `docker-compose.yml`:
+The Pipelines server is started automatically by `docker compose up -d`. The connection to Open WebUI is configured via environment variables in `docker-compose.yml`:
 
 ```yaml
 - OPENAI_API_BASE_URLS=http://localhost:8080/v1;http://localhost:9099
@@ -296,7 +302,22 @@ The Pipelines server (RAG filter) is started automatically by `docker compose up
 
 **Important:** The Pipelines server must be registered as a second OpenAI API connection using the semicolon-separated `OPENAI_API_BASE_URLS` and `OPENAI_API_KEYS` variables. Do NOT use `PIPELINES_URLS` or `PIPELINES_API_KEY` — Open WebUI v0.8.12 ignores these and the Admin Panel will show "Pipelines Not Detected." The default Pipelines API key is `0p3n-w3bu!`.
 
-Verify in the Admin Panel → Settings → Pipelines — you should see the "RAG Retrieval" filter listed.
+Verify in Admin Panel → Settings → Pipelines — you should see the "RAG Retrieval" filter listed.
+
+---
+
+## llama-server Flag Reference
+
+These flags are required for Qwen 3.5 specifically. Removing any of them produces a documented failure mode.
+
+| Flag | Why it's required |
+|---|---|
+| `--no-cache-prompt` | Qwen 3.5's hybrid Mamba/attention architecture invalidates KV cache on every request. Without this, cache save time escalates to 160 seconds per request |
+| `--poll 0` | Eliminates 100% idle CPU spin on one core |
+| `-np 2` | Prevents Open WebUI title-generation requests from cancelling the active chat generation mid-stream |
+| `--ctx-checkpoints 0` | Disables 50–87 MB checkpoint saves that block responses |
+| `--jinja` | Required for Qwen 3.5 chat template handling |
+| `-rea off` | Suppresses `<think>` tags that break JSON stream parsing in Pipelines |
 
 ---
 
@@ -329,45 +350,9 @@ pkill -9 llama-server
 ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf
 sleep 3 && bash ~/start-llama-qwen.sh &
 
-# Switch to 9B Q4_K_M — lowest VRAM, fastest load
-pkill -9 llama-server
-ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf
-sleep 3 && bash ~/start-llama-qwen.sh &
-
-# Check which model is currently active
-ls -la ~/models/qwen-active.gguf
-
 # Confirm what llama-server loaded
 curl -s http://localhost:8080/v1/models | python3 -c \
   "import sys,json; print(json.load(sys.stdin)['data'][0]['id'])"
-```
-
-### Convenience aliases
-
-Add to `~/.bashrc`:
-
-```bash
-alias model-9b-q6='pkill -9 llama-server; sleep 3; \
-  ln -sf ~/models/Qwen3.5-9B-Q6_K.gguf ~/models/qwen-active.gguf; \
-  bash ~/start-llama-qwen.sh & echo "Starting 9B Q6_K..."'
-
-alias model-9b-q4='pkill -9 llama-server; sleep 3; \
-  ln -sf ~/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf ~/models/qwen-active.gguf; \
-  bash ~/start-llama-qwen.sh & echo "Starting 9B Q4_K_M..."'
-
-alias model-27b='pkill -9 llama-server; sleep 3; \
-  ln -sf ~/models/qwen3.5-27b-q3_K_M.gguf ~/models/qwen-active.gguf; \
-  bash ~/start-llama-qwen.sh & echo "Starting 27B Q3_K_M..."'
-
-alias model-status='ls -la ~/models/qwen-active.gguf && \
-  curl -s http://localhost:8080/v1/models | python3 -c \
-  "import sys,json; print(json.load(sys.stdin)[\"data\"][0][\"id\"])"'
-```
-
-Apply changes:
-
-```bash
-source ~/.bashrc
 ```
 
 ### Full stack start / restart
@@ -377,18 +362,6 @@ bash ~/chuckai/scripts/startup.sh
 ```
 
 Kills everything, then starts services in dependency order with health checks. Safe to run on a fresh boot or against a running stack.
-
-### Docker services
-
-```bash
-docker compose up -d        # start all services (no dependency ordering)
-docker compose down         # stop all services
-docker compose restart      # restart all services
-docker compose ps           # check status
-docker compose logs -f      # watch logs
-```
-
-**Note:** `docker compose up -d` starts all containers simultaneously. Use `scripts/startup.sh` instead to ensure correct startup order (Pipelines before Open WebUI).
 
 ### Open WebUI backup and rollback
 
@@ -404,34 +377,14 @@ Open WebUI was upgraded from v0.5.20 to v0.8.12 on 2026-04-01. Local backups wer
 **Roll back to v0.5.20:**
 
 ```bash
-# 1. Stop current container
 cd ~ && docker compose down
-
-# 2. Edit ~/docker-compose.yml — change the image line:
-#    image: ghcr.io/open-webui/open-webui:latest
-#    to:
-#    image: open-webui-backup:v0.5.20
-
-# 3. Restore the v0.5.20 data backup into the named volume
+# Edit ~/docker-compose.yml — change image to: open-webui-backup:v0.5.20
 docker run --rm \
   -v chuck_open-webui:/data \
   -v ~/open-webui-backup-v0.5.20/data:/backup \
   alpine sh -c "rm -rf /data/* && cp -a /backup/. /data/"
-
-# 4. Start with the old version
 docker compose up -d
-
-# 5. Verify
-curl -s http://localhost:3000/api/version
-# Expected: {"version":"0.5.20"}
-```
-
-**Roll back to v0.8.12 (if a future `:latest` breaks):**
-
-```bash
-cd ~ && docker compose down
-# Edit ~/docker-compose.yml — change image to: open-webui-backup:v0.8.12
-docker compose up -d
+curl -s http://localhost:3000/api/version  # Expected: {"version":"0.5.20"}
 ```
 
 ### Full stack health check
@@ -442,18 +395,49 @@ echo "=== Active model ===" && ls -la ~/models/qwen-active.gguf
 echo "=== Open WebUI ===" && curl -s http://localhost:3000/api/version
 echo "=== SearXNG ===" && curl -s "http://localhost:8081/search?q=test&format=json" \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'OK - {len(d[\"results\"])} results')"
+echo "=== Qdrant ===" && curl -s http://localhost:6333/collections | python3 -m json.tool
+echo "=== Pipelines ===" && curl -s -H "Authorization: Bearer 0p3n-w3bu!" \
+  http://localhost:9099/models | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(f'OK - {[m[\"name\"] for m in d[\"data\"]]}')"
 echo "=== Docker ===" && docker compose ps
-echo "=== GPU ===" && rocm-smi --showmeminfo vram | grep -E "Used|Total"
+echo "=== GPU ===" && nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv
+echo "=== Ollama on CPU? ===" && nvidia-smi --query-compute-apps=pid,process_name --format=csv \
+  | grep -i ollama && echo "WARNING: Ollama is on GPU" || echo "OK - Ollama is CPU-only"
 ```
 
 ### GPU monitoring
 
 ```bash
-rocm-smi                                              # current state
-watch -n 1 rocm-smi                                   # live refresh
-watch -n 2 "rocm-smi --showmeminfo vram | grep Used"  # VRAM only
-grep "offload" ~/llama.log | head -5                  # confirm GPU layers at startup
+nvidia-smi                                          # current state
+watch -n 1 nvidia-smi                               # live refresh
+nvidia-smi --query-gpu=memory.used,memory.free \
+  --format=csv -l 2                                 # VRAM only, every 2s
 ```
+
+---
+
+## Troubleshooting Quick Reference
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| RAG silently returns no context, model answers from training data only | Ollama embedding model loaded onto GPU, contending with llama-server, Pipelines embed times out at 5s | Apply CPU override (Quick Start step 3). Verify with `nvidia-smi` — only llama-server should be listed |
+| `nvidia-smi` shows ollama process on GPU | CPU override missing or vendor-specific (only ROCm vars set) | Override must include `CUDA_VISIBLE_DEVICES=""` and `OLLAMA_NUM_GPU=0` — see Quick Start step 3 |
+| llama-server 100% CPU at idle | Busy-wait polling | Add `--poll 0` to startup script |
+| Multi-turn chat gets progressively slower | Prompt cache growing, saves take 40–160s | Add `--no-cache-prompt` (required for Qwen 3.5 hybrid arch) |
+| Slow first query after reboot | Cold Ollama/Qdrant caches | Run `bash ~/chuckai/scripts/warmup.sh` after startup |
+| Ollama embed hangs (>5s timeout in Pipelines logs) | GPU contention, see top row | CPU override |
+| RAG not triggering after restart | Pipelines filter disconnected from Open WebUI | `docker compose restart pipelines open-webui` — or better, use `scripts/startup.sh` |
+| "Expecting value: line 1 column 1" | Qwen think tags in stream | Confirm `-rea off` and `--jinja` in startup script |
+| "Open WebUI Backend Required" | Browser cache mismatch | Cmd+Shift+R or open private window |
+| SearXNG crashes immediately | Missing secret_key | Add secret_key to `~/searxng/settings.yml` |
+| Globe icon not visible | Web search not enabled | Admin Panel → Settings → Web Search → ON → Save |
+| Web search hangs, no response | Web search env vars set | Remove from docker-compose, configure via UI only |
+| "Pipelines Not Detected" in UI | `PIPELINES_URLS` env var used | Add pipelines URL to `OPENAI_API_BASE_URLS` instead |
+| Pipelines returns 401 | Missing API key | Use `0p3n-w3bu!` in `OPENAI_API_KEYS` |
+| Chat prompt returns empty/hangs | Title generation cancels chat (single slot) | Use `-np 2` in `start-llama-qwen.sh` |
+| RAG injects irrelevant context | RRF rank scores don't reflect relevance | Use dense cosine similarity for threshold filtering (`score_threshold` in Qdrant query) |
+| Services fail after reboot | Wrong startup order | Run `bash ~/chuckai/scripts/startup.sh` |
+| `nvidia-smi` shows GPU at 23+ GB used | Could be normal (Q6_K + q8_0 + 131K) or contention | Check process list — only llama-server should appear |
 
 ---
 
@@ -474,27 +458,110 @@ grep "offload" ~/llama.log | head -5                  # confirm GPU layers at st
 
 ## Roadmap
 
-### Phase 2 — RAG Stack ✓
-Qdrant on-disk vector database supporting 2–3TB of documents (~75–150M vectors). Hybrid BM25 sparse + semantic dense search with Reciprocal Rank Fusion. Universal document ingestion via Apache Tika and ebooklib. Incremental loading via file watcher — drop files into `~/documents/inbox/` or `~/documents/inbox_priority/` and they're indexed automatically. RAG retrieval wired into Open WebUI via a Pipelines filter that intercepts every chat query. End-to-end validated with EPUB, TXT, and structured queries.
-
-### Performance Tuning ✓
-Full-stack latency profiling (Open WebUI → Pipelines → Ollama/Qdrant → llama-server) identified prompt caching as the primary bottleneck. Qwen 3.5's hybrid Mamba/attention architecture forces llama-server to reprocess every prompt from scratch — the cache was being written and immediately invalidated, with save times escalating to 160 seconds per request. Disabled with `--no-cache-prompt`. Additional fixes: `--poll 0` for idle CPU spin, warmup script for cold-start latency, and improved error logging in the RAG pipeline.
-
-### RAG Retrieval Tuning ✓
-Live debugging revealed that RRF fusion scores are rank-based (always 0.500, 0.333, etc.), not relevance-based — making threshold filtering useless. Switched to dense cosine similarity for filtering with a 0.50 threshold. Fixed conversation history contamination (Open WebUI packs history into a single message), title generation cancelling active chat requests (`-np 1` → `-np 2`), and added response mode tags (`RAG`, `LLM`, `Web`) for retrieval transparency. Created sequenced startup script (`scripts/startup.sh`) to ensure correct service dependency ordering with health checks.
-
-### Next — Further Improvements
-- **Skip already-processed files** in the watcher to avoid redundant re-embedding on restart
-- **Corpus scaling** — test with larger document collections to validate on-disk HNSW performance
-
 ### Phase 3 — Document Output
 On-demand generation of Word documents, PowerPoint presentations, and PDFs from model output. Pandoc + LibreOffice conversion triggered by natural language requests in chat.
 
+### Performance Re-tuning on RTX 3090
+The performance work documented for the AMD build (prompt cache, idle CPU spin, cold start) carries forward unchanged — they're architectural properties of Qwen 3.5 and llama.cpp, not vendor-specific. Worth a fresh benchmark pass on the 3090 to characterize:
+- Generation token/s at Q6_K + q8_0 + 131K (likely substantially faster than the AMD build's ~49 tok/s)
+- Whether Config D (27B + q8_0 + 64K) is viable in practice or memory-bound
+- Cold-start cost differential between CUDA and ROCm builds
+
 ### Future
-- Image generation with Flux.1 on ROCm
+- Image generation with Flux.1
 - Voice interface
 - Homelab network architecture (Tailscale, Cloudflare Tunnel)
 - GCP hybrid mode — local inference, cloud-scale RAG index
+
+---
+
+## AMD Build Reference — RX 6800 XT, ROCm 6.3
+
+The original ChuckAI build ran on a 16GB RX 6800 XT under ROCm. Phase 1 and Phase 2 were both designed, built, and validated on this hardware over 14 months. This section preserves the AMD-specific knowledge that's still relevant when working with AMD AI hardware — whether revisiting this box on a swap, advising on customer AMD deployments, or evaluating Strix Halo / MI300X / RDNA 4 architectures.
+
+### Hardware spec (prior)
+
+| Component | Spec |
+|---|---|
+| GPU | AMD RX 6800 XT — 16GB GDDR6 |
+| Architecture | RDNA 2 |
+| GPU target | gfx1030 |
+| Driver stack | ROCm 6.3.0 |
+| Required OS | Ubuntu 22.04 LTS (Jammy) — **not** 24.04 |
+
+### Critical flags and gotchas
+
+**llama.cpp build command (AMD):**
+
+```bash
+cd ~/llama.cpp
+git pull
+cmake -B build \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS="gfx1030" \
+  -DCMAKE_PREFIX_PATH="/opt/rocm/lib/cmake/hip;/opt/rocm/lib/cmake/hip-lang;/opt/rocm" \
+  -DCMAKE_HIP_FLAGS="--gcc-toolchain=/usr/lib/gcc/x86_64-linux-gnu/11 \
+    -I/usr/include/c++/11 \
+    -I/usr/include/x86_64-linux-gnu/c++/11 \
+    -L/usr/lib/gcc/x86_64-linux-gnu/11 \
+    -L/usr/lib/x86_64-linux-gnu" \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/lib/gcc/x86_64-linux-gnu/11 \
+    -L/usr/lib/x86_64-linux-gnu -lstdc++ -lgcc_s"
+cmake --build build --config Release -j$(nproc)
+```
+
+**Critical flag:** `-DGGML_HIP=ON`, **not** `-DGGML_ROCM=ON`. The wrong flag causes a silent CPU-only fallback. The build succeeds, llama-server runs, inference works — at 1–2 tok/s instead of 50. The only way to catch it is checking the startup banner.
+
+**Verify GPU is detected before trusting the build:**
+
+```bash
+./build/bin/llama-server --version 2>&1 | head -3
+# Must show: found 1 ROCm devices: AMD Radeon RX 6800 XT, gfx1030
+```
+
+**Other AMD-specific gotchas:**
+
+| Gotcha | Detail |
+|---|---|
+| Ubuntu version | ROCm 6.3 APT repo only provides Jammy (22.04) packages. Noble (24.04) silently fails with missing packages. Stick to Jammy |
+| GCC version | The HIP build requires GCC 12 (`g++-12`) due to bundled clang header dependencies. Ubuntu 22.04 default is GCC 11. Install: `sudo apt install g++-12` |
+| GFX override | RX 6800 XT requires `export HSA_OVERRIDE_GFX_VERSION=10.3.0` in shell env and `start-llama-qwen.sh`, or ROCm refuses to load |
+| Ollama CPU override (legacy form) | The AMD-era override was `HIP_VISIBLE_DEVICES=-1` + `ROCR_VISIBLE_DEVICES=-1`. Both are needed — only one fails silently. Note: this is the override that became a no-op when the GPU was swapped to NVIDIA. The current override includes both vendor families |
+| OC gives nothing | RX 6800 XT generation speed at these model sizes is memory-bandwidth-bound, not compute-bound. GPU overclocking provides no measurable improvement |
+
+### AMD VRAM table (16GB)
+
+This was the working configuration table on the RX 6800 XT, kept here for reference:
+
+| Config | Model | KV Cache | Context | Total VRAM | Status |
+|---|---|---|---|---|---|
+| A — Fallback | Q4_K_M 9B | q4_0 | 131K | ~10.7 GB | Available |
+| B — Will spill | Q6_K 9B | q8_0 | 131K | ~16 GB | **Avoid** |
+| C — Primary | Q6_K 9B | q4_0 | 131K | ~14.5 GB | Active |
+| D — Comfortable | Q6_K 9B | q4_0 | 32K | ~8.7 GB | Use for non-coding |
+| E — Large model | Q3_K_M 27B | q4_0 | 32K | ~14.0 GB | Use for complex tasks |
+
+### AMD-era monitoring commands
+
+If revisiting AMD hardware, the equivalent of `nvidia-smi`:
+
+```bash
+rocm-smi                                              # current state
+watch -n 1 rocm-smi                                   # live refresh
+watch -n 2 "rocm-smi --showmeminfo vram | grep Used"  # VRAM only
+grep "offload" ~/llama.log | head -5                  # confirm GPU layers
+```
+
+### AMD performance characterization
+
+For reference when comparing to NVIDIA results:
+
+- Generation speed: ~49 tok/s on Q6_K 9B at any prompt size
+- RAG retrieval: 28-96ms total (embed ~28-69ms warm, Qdrant search ~3ms)
+- Cold start (first Ollama embed): ~750ms vs ~28ms warm
+- Memory bandwidth-bound, not compute-bound
+
+These numbers are the AMD baseline. The 3090 should improve on all of them.
 
 ---
 
